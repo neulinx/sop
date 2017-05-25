@@ -6,8 +6,18 @@ devel
 -----
 
 
-0.0.0
------
+2.0.0: state behaviors
+----------------------
+
+- Skip 1.x.x version scheme to keep for xl_sop project.
+- Add entry/exit/do behaviors of classic state.
+- Use new data type map() as internal data of stata.
+- Add more starting APIs.
+- Apply new style of comment lines.
+
+
+0.0.0: gen_server skeleton
+--------------------------
 
 - rebar3, v3.4.0
 - Makefile commands: all, devel, compile, dialyzer, unlock, cover, shell, reset,

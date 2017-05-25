@@ -1,6 +1,6 @@
 {application, sop,
  [{description, "State-oriented programming framework."},
-  {vsn, "0.0.0"},
+  {vsn, "2.0.0"},
   {registered, []},
   {applications,
    [kernel,
