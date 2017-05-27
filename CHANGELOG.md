@@ -5,8 +5,23 @@ CHANGELOG
 devel
 -----
 
+2.1.0: Dynamic attributes
+-------------------------
 
-2.0.0: state behaviors
+- Support attribute tree traverse.
+- Message format & protocol:
+  - gen_server:call(Signal, From, State)
+    - Signal: {To, Method, Args} | {To, Method} | Method.
+    - Convert to {sos, From, To, {Method, Args}}.
+  - Message: {sos, From, To, Command}.
+- function() & pid() types of attributes as dynamic attribute.
+- Attribute function suport fun/2, fun/3, fun/4.
+  - Func(Command, State)
+  - Func(Command, Sprig, State)
+  - Func(Command, Sprig, Via, State)
+- Add entry_time attribute when actor terminated.
+
+2.0.0: State behaviors
 ----------------------
 
 - Skip 1.x.x version scheme to keep for xl_sop project.

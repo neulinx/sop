@@ -52,13 +52,14 @@
                    'exit_time' => timestamp(),
                    'status' => status(),
                    'timeout' => timeout(),
-                   tag() => any()
+                   tag() => dynamic_attribute() | any()
                   }.
 
 %%-- Attributes types.
+-type dynamic_attribute() :: map() | function() | pid().
 -type entry_fun() :: fun((state()) -> result()).
 -type exit_fun() :: fun((state()) -> result()).
--type do_fun() :: fun((any(), state()) -> result()).
+-type do_fun() :: fun((request() | any(), state()) -> result()).
 -type timestamp() :: integer().  % by unit of microseconds.
 -type status() :: 'running' | 'stopped'.
 
@@ -69,6 +70,12 @@
                   {code(), any(), state()} |
                   {stop, Reason :: any(), Reply :: any(), state()}.
 
+%%-- Messages.
+-type request() :: {'sos', Command :: any()} |
+                   {'sos', sprig(), Command :: any()} |
+                   {'sos', via(), sprig(), Command :: any()}.
+-type sprig() :: list().
+-type via() :: {pid(), reference()}.
 
 %%- Starts the server
 %%------------------------------------------------------------------------------
@@ -151,8 +158,13 @@ do_entry(State) ->
 %%     {noreply, NewState :: term(), timeout() | hibernate} |
 %%     {stop, Reason :: term(), Reply :: term(), NewState :: term()} |
 %%     {stop, Reason :: term(), NewState :: term()}.
-handle_call(Signal, From, State) ->
-    handle_info({sos, From, Signal}, State).
+handle_call({To, Method, Args}, From, State) ->
+    handle_info({sos, From, To, {Method, Args}}, State);
+handle_call({To, Method}, From, State) ->
+    handle_info({sos, From, To, Method}, State);
+handle_call(Method, From, State) ->
+    handle_info({sos, From, [], Method}, State).
+
 
 %% Handling async cast messages.
 %% 
@@ -160,8 +172,12 @@ handle_call(Signal, From, State) ->
 %%     {noreply, NewState :: term()} |
 %%     {noreply, NewState :: term(), timeout() | hibernate} |
 %%     {stop, Reason :: term(), NewState :: term()}.
-handle_cast(Signal, State) ->
-    handle_info({sos, noreply, Signal}, State).
+handle_cast({To, Method, Args}, State) ->
+    handle_info({sos, noreply, To, {Method, Args}}, State);
+handle_cast({To, Method}, State) ->
+    handle_info({sos, noreply, To, Method}, State);
+handle_cast(Method, State) ->
+    handle_info({sos, noreply, [], Method}, State).
 
 %% Handling normal messages.
 %% 
@@ -169,23 +185,121 @@ handle_cast(Signal, State) ->
 %%     {noreply, NewState :: term()} |
 %%     {noreply, NewState :: term(), timeout() | hibernate} |
 %%     {stop, Reason :: term(), NewState :: term()}.
-handle_info({sos, From, _Signal} = Info, #{do := Do} = State) ->
-    case Do(Info, State) of
-        {stop, _, _} = Res ->
-            Res;
-        {stop, _, _, _} = Res ->
-            Res;
-        {noreply, _, _} = Res ->
-            Res;
-        {noreply, _} = Res ->
-            Res;
-        {Res, State} ->
-            reply(From, Res),
-            {noreply, State};
-        {Code, Res, State} ->
-            reply(From, {Code, Res}),
-            {noreply, State}
+handle_info(Info, State) ->
+    case maps:find(do, State) of
+        {ok, Do} ->
+            case Do(Info, State) of
+                {unhandled, S} ->
+                    handle(Info, S);
+                Res0 ->
+                    Res0
+            end;
+        error ->
+            handle(Info, State)
     end.
+
+handle({sos, Via, Sprig, Command}, State) ->
+    invoke(Sprig, Command, Via, State);
+handle({sos, Via, Command}, State) ->
+    invoke([], Command, Via, State);
+handle({sos, Command}, State) ->
+    invoke([], Command, noreply, State);
+handle(_, State) ->
+    {noreply, State}.
+
+invoke(Command, [], Via, State) ->
+    case access(Command, [], State) of
+        {reply, Res} ->
+            reply(Via, Res),
+            {noreply, State};
+        {update, Reply, NewS} when (not is_tuple(Command));
+                                   element(1, Command) =/= put ->
+            reply(Via, Reply),
+            {noreply, NewS};
+        _ ->
+            reply(Via, {error, badarg}),
+            {noreply, State}
+    end;
+invoke(Command, Sprig, Via, State) ->
+    case access(Command, Sprig, State) of
+        {reply, Res} ->
+            reply(Via, Res),
+            {noreply, State};
+        {update, Reply, NewState} ->
+            reply(Via, Reply),
+            {noreply, NewState};
+        {action, Func, Route} ->
+            case perform(Func, Command, Route, Via, State) of
+                {noreply, _} = Result ->
+                    Result;
+                {noreply, _, _} = Result ->
+                    Result;
+                {stop, _, _} = Result ->
+                    Result;
+                {stop, _, _, _} = Result ->
+                    Result;
+                {reply, Reply, NewState} ->
+                    reply(Via, Reply),
+                    {noreply, NewState};
+                {Reply, NewState} ->
+                    reply(Via, Reply),
+                    {noreply, NewState};
+                {Code, Res, NewState} ->
+                    reply(Via, {Code, Res}),
+                    {noreply, NewState}
+            end;
+        {actor, Pid, Sprig} ->
+            catch Pid ! {sos, Via, Sprig, Command},
+            {noreply, State};
+        _ ->
+            {error, badarg, State}
+    end.
+
+access(get, [], Data) ->
+    {reply, {ok, Data}};
+access({put, Value}, [], _) ->
+    {update, ok, Value};
+access(delete, [], _) ->
+    {delete, ok};
+access({get, Selection}, [], Data)
+  when is_list(Selection) andalso is_map(Data) ->
+    Value = maps:with(Selection, Data),
+    {reply, {ok, Value}};
+access({patch, Value}, [], Data)
+  when is_map(Value) andalso is_map(Data) ->
+    NewData = maps:merge(Data, Value),
+    {update, ok, NewData};
+access({new, Key, Value}, [], Data) when is_map(Data) ->
+    {update, {ok, Key}, Data#{Key => Value}};
+access(Command, [Key | Rest], Data) when is_map(Data) ->
+    case maps:find(Key, Data) of
+        {ok, Value} ->
+            case access(Command, Rest, Value) of
+                {update, Reply, NewValue} ->
+                    {update, Reply, Data#{Key => NewValue}};
+                {delete, Reply} ->
+                    {update, Reply, maps:remove(Key, Data)};
+                Result ->
+                    Result
+            end;
+        error ->
+            {reply, {error, undefined}}
+    end;
+access(_, Sprig, Data) when is_function(Data) ->
+    {action, Data, Sprig};
+access(_, Sprig, Data) when is_pid(Data) ->
+    {actor, Data, Sprig};
+access(_, [], _) ->
+    {reply, {error, badarg}};
+access(Command, Key, State) ->
+    access(Command, [Key], State).
+
+perform(Func, Command, _, _, State) when is_function(Func, 2) ->
+    Func(Command, State);
+perform(Func, Command, Sprig, _, State) when is_function(Func, 3) ->
+    Func(Command, Sprig, State);
+perform(Func, Command, Sprig, Via, State) ->
+    Func(Command, Sprig, Via, State).
 
 -spec reply({tag(), reference()}, Reply :: any()) -> 'ok'.
 reply({To, Tag}, Reply) ->
@@ -205,7 +319,7 @@ reply(_, _) ->
 %%     term().
 
 terminate(Reason, #{exit := Exit} = State) ->
-    Exit(Reason, State);
+    Exit(Reason, State#{exit_time => timestamp()});
 terminate(_Reason, _State) ->
     ok.
 
