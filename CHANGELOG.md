@@ -5,6 +5,12 @@ CHANGELOG
 devel
 -----
 
+Actor behaviors
+
+- Add new message format: {sos, Via, Path, Sprig, Command}.
+- Add new methods: link, unlink, act, subscribe, unsubscribe.
+- New system attributes: links, actions, monitors, subscribers.
+
 2.1.0: Dynamic attributes
 -------------------------
 
