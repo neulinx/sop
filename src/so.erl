@@ -52,6 +52,7 @@
                    'exit_time' => timestamp(),
                    'status' => status(),
                    'timeout' => timeout(),
+                   'actions' => dynamic_attribute(),
                    tag() => dynamic_attribute() | any()
                   }.
 
@@ -220,6 +221,11 @@ invoke(Command, [], Via, State) ->
             reply(Via, {error, badarg}),
             {noreply, State}
     end;
+%% Custmoized actions
+invoke(act, [Action], Via, State) ->
+    invoke(Action, [actions], Via, State);
+invoke({act, Args}, [Action], Via, State) ->
+    invoke({Action, Args}, [actions], Via, State);
 invoke(Command, Sprig, Via, State) ->
     case access(Command, Sprig, State) of
         {reply, Res} ->
