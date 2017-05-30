@@ -53,6 +53,7 @@
                    'status' => status(),
                    'timeout' => timeout(),
                    'actions' => dynamic_attribute(),
+                   'links' => dynamic_attribute(),
                    tag() => dynamic_attribute() | any()
                   }.
 
@@ -133,15 +134,12 @@ merge_options(Options, State) ->
 init(State) ->
     self() ! xl_run,
     process_flag(trap_exit, true),
-    S0 = State#{pid => self(),
-                status => running,
-                entry_time => timestamp()},
-    S1 = case maps:find(timeout, S0) of
-             error ->
-                 S0#{timeout => ?DFL_TIMEOUT};
-             _ ->
-                 S0
-         end,
+    S0 = #{entry_time => timestamp(),
+           pid => self(),
+           status => running,
+           links => #{},
+           timeout => ?DFL_TIMEOUT},
+    S1 = maps:merge(S0, State),
     do_entry(S1).
 
 do_entry(#{entry := Entry} = State) ->
@@ -226,6 +224,22 @@ invoke(act, [Action], Via, State) ->
     invoke(Action, [actions], Via, State);
 invoke({act, Args}, [Action], Via, State) ->
     invoke({Action, Args}, [actions], Via, State);
+invoke({link, Process}, [Label], Via, #{links := Ls} = State)
+  when is_map(Ls) ->
+    case maps:is_key(Label, Ls) of
+        true ->
+            reply(Via, {error, already_linked}),
+            {noreply, State};
+        false ->
+            M = maps:get(monitors, State, #{}),
+            Ref = monitor(process, Process),
+            Monitors = M#{Ref => Label},
+            Links = Ls#{Label => {Process, Ref}},
+            reply(Via, ok),
+            {noreply, State#{links := Links, monitors => Monitors}}
+    end;
+invoke({unlink, Process}, [Label], Via, #{links := Ls} = State)
+  when is_map(Ls) ->
 invoke(Command, Sprig, Via, State) ->
     case access(Command, Sprig, State) of
         {reply, Res} ->
