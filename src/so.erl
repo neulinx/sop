@@ -73,11 +73,16 @@
                   {stop, Reason :: any(), Reply :: any(), state()}.
 
 %%-- Messages.
--type request() :: {'sos', Command :: any()} |
-                   {'sos', sprig(), Command :: any()} |
-                   {'sos', via(), sprig(), Command :: any()}.
+-type request() :: {'sos', command()} |
+                   {'sos', sprig(), command()} |
+                   {'sos', via(), sprig(), command()} |
+                   {'sos', via(), path(), sprig(), command()}.
 -type sprig() :: list().
--type via() :: {pid(), reference()}.
+-type via() :: {pid(), reference()} | 'call' | 'cast'.
+-type path() :: list().
+-type command() :: method() | {method(), any()} | {method(), any(), any()}.
+-type method() :: 'get' | 'put' | 'patch' | 'new' | 'delete' | 'act' |
+                  'link' | 'unlink' | 'subscribe' | 'unsubscribe' | any().
 
 %%- Starts the server
 %%------------------------------------------------------------------------------
@@ -172,11 +177,11 @@ handle_call(Method, From, State) ->
 %%     {noreply, NewState :: term(), timeout() | hibernate} |
 %%     {stop, Reason :: term(), NewState :: term()}.
 handle_cast({To, Method, Args}, State) ->
-    handle_info({sos, noreply, To, {Method, Args}}, State);
+    handle_info({sos, cast, To, {Method, Args}}, State);
 handle_cast({To, Method}, State) ->
-    handle_info({sos, noreply, To, Method}, State);
+    handle_info({sos, cast, To, Method}, State);
 handle_cast(Method, State) ->
-    handle_info({sos, noreply, [], Method}, State).
+    handle_info({sos, cast, [], Method}, State).
 
 %% Handling normal messages.
 %% 
@@ -197,16 +202,98 @@ handle_info(Info, State) ->
             handle(Info, State)
     end.
 
+%%-- sop messages.
+handle({sos, Via, Path, Sprig, Command}, State) ->
+    relay(Path, Via, Sprig, Command, State);
 handle({sos, Via, Sprig, Command}, State) ->
-    invoke(Sprig, Command, Via, State);
+    request(Sprig, Command, Via, State);
 handle({sos, Via, Command}, State) ->
-    invoke([], Command, Via, State);
+    request([], Command, Via, State);
 handle({sos, Command}, State) ->
-    invoke([], Command, noreply, State);
+    request([], Command, cast, State);
+%%-- process monitors.
+handle({'DOWN', _, _, _, _} = Down, State) ->
+    case on_down(Down, State) of
+        {_, NewState} ->
+            {noreply, NewState};
+        Stop ->
+            Stop
+    end;
+%%-- drop unknown messages.
 handle(_, State) ->
     {noreply, State}.
 
-invoke(Command, [], Via, State) ->
+relay([], Via, Sprig, Command, State) ->
+    request(Sprig, Command, Via, State);
+relay([Next | Rest], Via, Sprig, Command, State) ->
+    case access(get, [links, Next], State) of
+        {reply, {ok, Pid}} when is_pid(Pid) ->
+            Via1 = append_via(Via),
+            Pid ! {sos, Via1, Rest, Sprig, Command},
+            {noreply, State};
+        _ ->
+            reply(Via, {error, badarg}),
+            {noreply, State}
+    end;
+relay(_, Via, _, _, State) ->
+    reply(Via, {error, badarg}),
+    {noreply, State}.
+
+append_via({Route, Ref}) ->
+    make_via(self(), Route, Ref);
+append_via(Via) ->
+    Via.
+
+make_via(Pid, Route, Ref) when is_list(Route) ->
+    {[Pid | Route], Ref};
+make_via(Pid, Route, Ref) ->
+    {[Pid, Route], Ref}.
+
+
+on_down({_, Ref, _, _, _} = Down, #{subscribers := Sbs} = State)
+  when is_map(Sbs) ->
+    case maps:remove(Ref, Sbs) of
+        Sbs ->
+            on_down_(Ref, Down, State);
+        Sbs1 ->
+            {noreply, State#{subscribers := Sbs1}}
+    end;
+on_down(Down, #{subscribers := _} = State) ->
+    case request({down, Down}, [subscribers], cast, State) of
+        {_, State1} ->
+            on_down_(Down, State1);
+        Stop ->
+            Stop
+    end;
+on_down(Down, State) ->
+    on_down_(Down, State).
+
+on_down_({_, Ref, _, _, _}, #{monitors := M, links := L} = State)
+  when is_map(L) ->
+    case maps:take(Ref, M) of
+        {#{name := Key}, M1} ->
+            L1 = maps:remove(Key, L),
+            {noreply, State#{monitors := M1, links := L1}};
+        error ->
+            {noreply, State}
+    end;
+on_down_(Down, #{links := _}, State) ->
+    request({down, Down}, [links, Key], cast, State);
+on_down_(_, State) ->
+    {noreply, State}.
+
+%%-- Suberscribers
+request({subscribe, Pid}, [], Via, State) ->
+    subscribe(Pid, Via, State);
+request({unsubscribe, Ref}, [], Via, State) ->
+    unsubscribe(Ref, Via, State);
+%%-- Links
+request({link, Label, Pid}, [], Via,  State) ->
+    link(Label, Pid, Via, State);
+request({unlink, Label}, [], Via, State) ->
+    unlink(Label, Via, State);
+%%-- Global commands.
+request(Command, [], Via, State) ->
     case access(Command, [], State) of
         {reply, Res} ->
             reply(Via, Res),
@@ -219,28 +306,16 @@ invoke(Command, [], Via, State) ->
             reply(Via, {error, badarg}),
             {noreply, State}
     end;
-%% Custmoized actions
-invoke(act, [Action], Via, State) ->
-    invoke(Action, [actions], Via, State);
-invoke({act, Args}, [Action], Via, State) ->
-    invoke({Action, Args}, [actions], Via, State);
-invoke({link, Process}, [Label], Via, #{links := Ls} = State)
-  when is_map(Ls) ->
-    case maps:is_key(Label, Ls) of
-        true ->
-            reply(Via, {error, already_linked}),
-            {noreply, State};
-        false ->
-            M = maps:get(monitors, State, #{}),
-            Ref = monitor(process, Process),
-            Monitors = M#{Ref => Label},
-            Links = Ls#{Label => {Process, Ref}},
-            reply(Via, ok),
-            {noreply, State#{links := Links, monitors => Monitors}}
-    end;
-invoke({unlink, Process}, [Label], Via, #{links := Ls} = State)
-  when is_map(Ls) ->
-invoke(Command, Sprig, Via, State) ->
+%%-- .. Links
+request(unlink, [Label], Via, State) ->
+    unlink(Label, Via, State);
+%%-- Custmoized actions
+request(act, [Action], Via, State) ->
+    request(Action, [actions], Via, State);
+request({act, Args}, [Action], Via, State) ->
+    request({Action, Args}, [actions], Via, State);
+%%-- Branches and sprig.
+request(Command, Sprig, Via, State) ->
     case access(Command, Sprig, State) of
         {reply, Res} ->
             reply(Via, Res),
@@ -320,6 +395,67 @@ perform(Func, Command, Sprig, _, State) when is_function(Func, 3) ->
     Func(Command, Sprig, State);
 perform(Func, Command, Sprig, Via, State) ->
     Func(Command, Sprig, Via, State).
+
+link(Key, Pid, Via, State) ->
+    case maps:get(links, State , #{}) of
+        Links when is_map(Links) ->
+            link(Key, Pid, Links, Via, State);
+        Links ->  % function
+            request({link, Key, Pid}, [links], Via, State)
+    end.
+
+link(Key, Pid, Links, Via, State) ->
+    case maps:is_key(Key, Links) of
+        true ->
+            reply(Via, {error, existed}),
+            {noreply, State};
+        false ->
+            M = maps:get(monitors, State, #{}),
+            Ref = monitor(process, Pid),
+            NewM = M#{Ref => #{name => Key, process => Pid}},
+            NewLinks = Links#{Label => #{process => Pid, monitor => Ref}},
+            reply(Via, ok),
+            {noreply, State#{links := NewLinks, monitors => NewM}}
+    end.
+
+unlink(Key, Via, #{links := Ls, monitors := Ms} = State) when is_map(Ls) ->
+    case maps:take(Key, Ls) of
+        {#{monitor := Ref}, Ls1} ->
+            Ms1 = maps:remove(Ref, Ms),
+            demonitor(Ref),
+            reply(Via, ok),
+            {noreply, State#{links := Ls1, monitors := Ms1}};
+        error ->
+            reply(Via, {error, undefined}),
+            {noreply, State}
+    end;
+unlink(Key, Via, #{links := Ls} = State) ->
+    request(unlink, [links, Key], Via, State);
+unlink(_, Via, State) ->
+    reply(Via, {error, undefined}),
+    {noreply, State}.
+
+subscribe(Pid, Via, State) ->
+    case maps:get(subscribers, State , #{}) of
+        Sbs when is_map(Sbs) ->
+            Ref = monitor(process, Pid),
+            reply(Via, {ok, Ref}),
+            Sbs1 = Sbs#{Ref => Pid},
+            {noreply, State#{subscribers => Sbs1}};
+        Sbs ->  % function
+            request({subscribe, Pid}, [subscribers], Via, State)
+    end.
+
+unsubscribe(Mref, Via, #{subscribers := Sbs} = State) when is_map(Sbs) ->
+    demonitor(Mref),
+    reply(Via, ok),
+    Sbs1 = maps:remove(Mref, Sbs),
+    {noreply, State#{subscribers => Sbs1}};
+unsubscribe(Mref, Via, #{subscribers := Sbs} = State) ->
+    request({unsubscribe, Mref}, [subscribers], Via, State);
+unsubscribe(_, Via, State) ->
+    reply(Via, {error, undefined}),
+    {noreply, State}.
 
 -spec reply({tag(), reference()}, Reply :: any()) -> 'ok'.
 reply({To, Tag}, Reply) ->
