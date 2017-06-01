@@ -350,6 +350,8 @@ request(Command, Sprig, Via, State) ->
             {error, badarg, State}
     end.
 
+response({result, Result}, 
+
 access(get, [], Data) ->
     {reply, {ok, Data}};
 access({put, Value}, [], _) ->

@@ -2,11 +2,10 @@ CHANGELOG
 =========
 
 
-devel
------
+sop v2 branch
+-------------
 
-Actor behaviors
-
+- Actor behaviors.
 - Add new message format: {sos, Via, Path, Sprig, Command}.
 - Add new methods: link, unlink, act, subscribe, unsubscribe.
 - New system attributes: links, actions, monitors, subscribers.
