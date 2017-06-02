@@ -2,43 +2,27 @@ CHANGELOG
 =========
 
 
-sop v2 branch
--------------
+devel
+-----
 
-- Actor behaviors.
-- Add new message format: {sos, Via, Path, Sprig, Command}.
-- Add new methods: link, unlink, act, subscribe, unsubscribe.
-- New system attributes: links, actions, monitors, subscribers.
-
-2.1.0: Dynamic attributes
--------------------------
-
+- Skip 1.x.x version scheme to keep for xl_sop project.
 - Support attribute tree traverse.
 - Message format & protocol:
-  - gen_server:call(Signal, From, State)
-    - Signal: {To, Method, Args} | {To, Method} | Method.
-    - Convert to {sos, From, To, {Method, Args}}.
-  - Message: {sos, From, To, Command}.
+  - `gen_server:call(Signal, From, State)`
+    - Signal: `{To, Method, Args} | {To, Method} | Method`.
+    - Convert to `{sos, From, To, {Method, Args}}`.
+  - Message: `{sos, From, To, Command}`.
 - function() & pid() types of attributes as dynamic attribute.
 - Attribute function suport fun/2, fun/3, fun/4.
   - Func(Command, State)
   - Func(Command, Sprig, State)
   - Func(Command, Sprig, Via, State)
-- Add entry_time attribute when actor terminated.
-
-2.0.0: State behaviors
-----------------------
-
-- Skip 1.x.x version scheme to keep for xl_sop project.
+- Add `entry_time` attribute at startup of actor process.
+- Add `exit_time` attribute when actor terminated.
 - Add entry/exit/do behaviors of classic state.
 - Use new data type map() as internal data of stata.
 - Add more starting APIs.
 - Apply new style of comment lines.
-
-
-0.0.0: gen_server skeleton
---------------------------
-
 - rebar3, v3.4.0
 - Makefile commands: all, devel, compile, dialyzer, unlock, cover, shell, reset,
   test, clean.

@@ -6,7 +6,7 @@
 %%% @end
 %%% Created : 24 May 2017 by Gary Hai <gary@XL59.com>
 %%%-------------------------------------------------------------------
--module(so).
+-module(sop).
 
 %% Support inline unit test for EUnit.
 -ifdef(TEST).
@@ -52,8 +52,6 @@
                    'exit_time' => timestamp(),
                    'status' => status(),
                    'timeout' => timeout(),
-                   'actions' => dynamic_attribute(),
-                   'links' => dynamic_attribute(),
                    tag() => dynamic_attribute() | any()
                   }.
 
@@ -61,9 +59,9 @@
 -type dynamic_attribute() :: map() | function() | pid().
 -type entry_fun() :: fun((state()) -> result()).
 -type exit_fun() :: fun((state()) -> result()).
--type do_fun() :: fun((request() | any(), state()) -> result()).
+-type do_fun() :: fun((signal() | any(), state()) -> result()).
 -type timestamp() :: integer().  % by unit of microseconds.
--type status() :: 'running' | 'stopped'.
+-type status() :: 'running' | tag().
 
 %%-- Refined types.
 -type tag() :: atom() | string() | binary() | integer() | tuple().
@@ -73,16 +71,13 @@
                   {stop, Reason :: any(), Reply :: any(), state()}.
 
 %%-- Messages.
--type request() :: {'sos', command()} |
-                   {'sos', sprig(), command()} |
-                   {'sos', via(), sprig(), command()} |
-                   {'sos', via(), path(), sprig(), command()}.
--type sprig() :: list().
--type via() :: {pid(), reference()} | 'call' | 'cast'.
--type path() :: list().
--type command() :: method() | {method(), any()} | {method(), any(), any()}.
--type method() :: 'get' | 'put' | 'patch' | 'new' | 'delete' | 'act' |
-                  'link' | 'unlink' | 'subscribe' | 'unsubscribe' | any().
+-type signal() :: {'sos', command()} |
+                  {'sos', to(), command()} |
+                  {'sos', from(), to(), command()}.
+-type to() :: list() | tag().
+-type from() :: {pid(), reference()} | 'call' | 'cast'.
+-type command() :: method() | {method(), any()} | {'new', any(), any()} | any().
+-type method() :: 'get' | 'put' | 'patch' | 'delete' | 'new' | tag().
 
 %%- Starts the server
 %%------------------------------------------------------------------------------
@@ -137,19 +132,17 @@ merge_options(Options, State) ->
 %%     {ok, State :: term()} | {ok, State :: term(), timeout() | hibernate} |
 %%     {stop, Reason :: term()} | ignore.
 init(State) ->
-    self() ! xl_run,
     process_flag(trap_exit, true),
     S0 = #{entry_time => timestamp(),
            pid => self(),
            status => running,
-           links => #{},
            timeout => ?DFL_TIMEOUT},
     S1 = maps:merge(S0, State),
-    do_entry(S1).
+    on_entry(S1).
 
-do_entry(#{entry := Entry} = State) ->
+on_entry(#{entry := Entry} = State) ->
     Entry(State);
-do_entry(State) ->
+on_entry(State) ->
     {ok, State}.
 
 %% Handling sync call messages.
@@ -203,128 +196,41 @@ handle_info(Info, State) ->
     end.
 
 %%-- sop messages.
-handle({sos, Via, Path, Sprig, Command}, State) ->
-    relay(Path, Via, Sprig, Command, State);
-handle({sos, Via, Sprig, Command}, State) ->
-    request(Sprig, Command, Via, State);
-handle({sos, Via, Command}, State) ->
-    request([], Command, Via, State);
+handle({sos, From, To, Command}, State) ->
+    request(To, Command, From, State);
+handle({sos, From, Command}, State) ->
+    request([], Command, From, State);
 handle({sos, Command}, State) ->
     request([], Command, cast, State);
-%%-- process monitors.
-handle({'DOWN', _, _, _, _} = Down, State) ->
-    case on_down(Down, State) of
-        {_, NewState} ->
-            {noreply, NewState};
-        Stop ->
-            Stop
-    end;
 %%-- drop unknown messages.
 handle(_, State) ->
     {noreply, State}.
 
-relay([], Via, Sprig, Command, State) ->
-    request(Sprig, Command, Via, State);
-relay([Next | Rest], Via, Sprig, Command, State) ->
-    case access(get, [links, Next], State) of
-        {reply, {ok, Pid}} when is_pid(Pid) ->
-            Via1 = append_via(Via),
-            Pid ! {sos, Via1, Rest, Sprig, Command},
-            {noreply, State};
-        _ ->
-            reply(Via, {error, badarg}),
-            {noreply, State}
-    end;
-relay(_, Via, _, _, State) ->
-    reply(Via, {error, badarg}),
-    {noreply, State}.
-
-append_via({Route, Ref}) ->
-    make_via(self(), Route, Ref);
-append_via(Via) ->
-    Via.
-
-make_via(Pid, Route, Ref) when is_list(Route) ->
-    {[Pid | Route], Ref};
-make_via(Pid, Route, Ref) ->
-    {[Pid, Route], Ref}.
-
-
-on_down({_, Ref, _, _, _} = Down, #{subscribers := Sbs} = State)
-  when is_map(Sbs) ->
-    case maps:remove(Ref, Sbs) of
-        Sbs ->
-            on_down_(Ref, Down, State);
-        Sbs1 ->
-            {noreply, State#{subscribers := Sbs1}}
-    end;
-on_down(Down, #{subscribers := _} = State) ->
-    case request({down, Down}, [subscribers], cast, State) of
-        {_, State1} ->
-            on_down_(Down, State1);
-        Stop ->
-            Stop
-    end;
-on_down(Down, State) ->
-    on_down_(Down, State).
-
-on_down_({_, Ref, _, _, _}, #{monitors := M, links := L} = State)
-  when is_map(L) ->
-    case maps:take(Ref, M) of
-        {#{name := Key}, M1} ->
-            L1 = maps:remove(Key, L),
-            {noreply, State#{monitors := M1, links := L1}};
-        error ->
-            {noreply, State}
-    end;
-on_down_(Down, #{links := _}, State) ->
-    request({down, Down}, [links, Key], cast, State);
-on_down_(_, State) ->
-    {noreply, State}.
-
-%%-- Suberscribers
-request({subscribe, Pid}, [], Via, State) ->
-    subscribe(Pid, Via, State);
-request({unsubscribe, Ref}, [], Via, State) ->
-    unsubscribe(Ref, Via, State);
-%%-- Links
-request({link, Label, Pid}, [], Via,  State) ->
-    link(Label, Pid, Via, State);
-request({unlink, Label}, [], Via, State) ->
-    unlink(Label, Via, State);
-%%-- Global commands.
-request(Command, [], Via, State) ->
+%% Invoke at root of actor.
+request(Command, [], From, State) ->
     case access(Command, [], State) of
-        {reply, Res} ->
-            reply(Via, Res),
+        {result, Res} ->
+            reply(From, Res),
             {noreply, State};
         {update, Reply, NewS} when (not is_tuple(Command));
                                    element(1, Command) =/= put ->
-            reply(Via, Reply),
+            reply(From, Reply),
             {noreply, NewS};
         _ ->
-            reply(Via, {error, badarg}),
+            reply(From, {error, badarg}),
             {noreply, State}
     end;
-%%-- .. Links
-request(unlink, [Label], Via, State) ->
-    unlink(Label, Via, State);
-%%-- Custmoized actions
-request(act, [Action], Via, State) ->
-    request(Action, [actions], Via, State);
-request({act, Args}, [Action], Via, State) ->
-    request({Action, Args}, [actions], Via, State);
-%%-- Branches and sprig.
-request(Command, Sprig, Via, State) ->
-    case access(Command, Sprig, State) of
-        {reply, Res} ->
-            reply(Via, Res),
+%% Branches and sprig.
+request(Command, To, From, State) ->
+    case access(Command, To, State) of
+        {result, Res} ->
+            reply(From, Res),
             {noreply, State};
         {update, Reply, NewState} ->
-            reply(Via, Reply),
+            reply(From, Reply),
             {noreply, NewState};
         {action, Func, Route} ->
-            case perform(Func, Command, Route, Via, State) of
+            case perform(Func, Command, Route, From, State) of
                 {noreply, _} = Result ->
                     Result;
                 {noreply, _, _} = Result ->
@@ -333,27 +239,22 @@ request(Command, Sprig, Via, State) ->
                     Result;
                 {stop, _, _, _} = Result ->
                     Result;
-                {reply, Reply, NewState} ->
-                    reply(Via, Reply),
-                    {noreply, NewState};
                 {Reply, NewState} ->
-                    reply(Via, Reply),
+                    reply(From, Reply),
                     {noreply, NewState};
                 {Code, Res, NewState} ->
-                    reply(Via, {Code, Res}),
+                    reply(From, {Code, Res}),
                     {noreply, NewState}
             end;
         {actor, Pid, Sprig} ->
-            catch Pid ! {sos, Via, Sprig, Command},
+            catch Pid ! {sos, From, Sprig, Command},
             {noreply, State};
         _ ->
             {error, badarg, State}
     end.
 
-response({result, Result}, 
-
 access(get, [], Data) ->
-    {reply, {ok, Data}};
+    {result, {ok, Data}};
 access({put, Value}, [], _) ->
     {update, ok, Value};
 access(delete, [], _) ->
@@ -361,7 +262,7 @@ access(delete, [], _) ->
 access({get, Selection}, [], Data)
   when is_list(Selection) andalso is_map(Data) ->
     Value = maps:with(Selection, Data),
-    {reply, {ok, Value}};
+    {result, {ok, Value}};
 access({patch, Value}, [], Data)
   when is_map(Value) andalso is_map(Data) ->
     NewData = maps:merge(Data, Value),
@@ -380,14 +281,14 @@ access(Command, [Key | Rest], Data) when is_map(Data) ->
                     Result
             end;
         error ->
-            {reply, {error, undefined}}
+            {result, {error, undefined}}
     end;
 access(_, Sprig, Data) when is_function(Data) ->
     {action, Data, Sprig};
 access(_, Sprig, Data) when is_pid(Data) ->
     {actor, Data, Sprig};
 access(_, [], _) ->
-    {reply, {error, badarg}};
+    {result, {error, badarg}};
 access(Command, Key, State) ->
     access(Command, [Key], State).
 
@@ -395,69 +296,8 @@ perform(Func, Command, _, _, State) when is_function(Func, 2) ->
     Func(Command, State);
 perform(Func, Command, Sprig, _, State) when is_function(Func, 3) ->
     Func(Command, Sprig, State);
-perform(Func, Command, Sprig, Via, State) ->
-    Func(Command, Sprig, Via, State).
-
-link(Key, Pid, Via, State) ->
-    case maps:get(links, State , #{}) of
-        Links when is_map(Links) ->
-            link(Key, Pid, Links, Via, State);
-        Links ->  % function
-            request({link, Key, Pid}, [links], Via, State)
-    end.
-
-link(Key, Pid, Links, Via, State) ->
-    case maps:is_key(Key, Links) of
-        true ->
-            reply(Via, {error, existed}),
-            {noreply, State};
-        false ->
-            M = maps:get(monitors, State, #{}),
-            Ref = monitor(process, Pid),
-            NewM = M#{Ref => #{name => Key, process => Pid}},
-            NewLinks = Links#{Label => #{process => Pid, monitor => Ref}},
-            reply(Via, ok),
-            {noreply, State#{links := NewLinks, monitors => NewM}}
-    end.
-
-unlink(Key, Via, #{links := Ls, monitors := Ms} = State) when is_map(Ls) ->
-    case maps:take(Key, Ls) of
-        {#{monitor := Ref}, Ls1} ->
-            Ms1 = maps:remove(Ref, Ms),
-            demonitor(Ref),
-            reply(Via, ok),
-            {noreply, State#{links := Ls1, monitors := Ms1}};
-        error ->
-            reply(Via, {error, undefined}),
-            {noreply, State}
-    end;
-unlink(Key, Via, #{links := Ls} = State) ->
-    request(unlink, [links, Key], Via, State);
-unlink(_, Via, State) ->
-    reply(Via, {error, undefined}),
-    {noreply, State}.
-
-subscribe(Pid, Via, State) ->
-    case maps:get(subscribers, State , #{}) of
-        Sbs when is_map(Sbs) ->
-            Ref = monitor(process, Pid),
-            reply(Via, {ok, Ref}),
-            Sbs1 = Sbs#{Ref => Pid},
-            {noreply, State#{subscribers => Sbs1}};
-        Sbs ->  % function
-            request({subscribe, Pid}, [subscribers], Via, State)
-    end.
-
-unsubscribe(Mref, Via, #{subscribers := Sbs} = State) when is_map(Sbs) ->
-    demonitor(Mref),
-    reply(Via, ok),
-    Sbs1 = maps:remove(Mref, Sbs),
-    {noreply, State#{subscribers => Sbs1}};
-unsubscribe(Mref, Via, #{subscribers := Sbs} = State) ->
-    request({unsubscribe, Mref}, [subscribers], Via, State);
-unsubscribe(_, Via, State) ->
-    reply(Via, {error, undefined}),
-    {noreply, State}.
+perform(Func, Command, Sprig, From, State) ->
+    Func(Command, Sprig, From, State).
 
 -spec reply({tag(), reference()}, Reply :: any()) -> 'ok'.
 reply({To, Tag}, Reply) ->
