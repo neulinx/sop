@@ -3,7 +3,7 @@ all: compile
 compile dialyzer unlock cover shell:
 	./rebar3 $@
 
-reset: clean unlock
+reset: clean
 	rm -rf _build
 
 devel:

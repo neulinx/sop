@@ -2,7 +2,16 @@ CHANGELOG
 =========
 
 
-devel
+2.2.0
+-----
+
+- Add {new, Value} command. Generate unique attribute name and return it.
+- `new` request with key name reponse only `ok`.
+- Export `timestamp/0, make_tag/0, make_tag/1, new_attribute/2`.
+- `make reset` don't remove rebar.lock file.
+
+
+2.0.0
 -----
 
 - Skip 1.x.x version scheme to keep for xl_sop project.
@@ -23,7 +32,7 @@ devel
 - Use new data type map() as internal data of stata.
 - Add more starting APIs.
 - Apply new style of comment lines.
-- rebar3, v3.4.0
+- rebar3, v3.4.1
 - Makefile commands: all, devel, compile, dialyzer, unlock, cover, shell, reset,
   test, clean.
 - Erlang/OTP 19 Erts 8.3

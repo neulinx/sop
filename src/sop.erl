@@ -27,6 +27,7 @@
 
 %%-- Helpers
 -export([reply/2]).
+-export([timestamp/0, make_tag/0, make_tag/1, new_attribute/2]).
 
 
 %%- MACROS
@@ -268,7 +269,10 @@ access({patch, Value}, [], Data)
     NewData = maps:merge(Data, Value),
     {update, ok, NewData};
 access({new, Key, Value}, [], Data) when is_map(Data) ->
-    {update, {ok, Key}, Data#{Key => Value}};
+    {update, ok, Data#{Key => Value}};
+access({new, Value}, [], Data) when is_map(Data) ->
+    {Key, NewData} = new_attribute(Value, Data),
+    {update, {ok, Key}, NewData};
 access(Command, [Key | Rest], Data) when is_map(Data) ->
     case maps:find(Key, Data) of
         {ok, Value} ->
@@ -334,3 +338,19 @@ code_change(_OldVsn, State, _Extra) ->
 %%------------------------------------------------------------------------------
 timestamp() ->
     erlang:system_time(micro_seconds).
+
+make_tag() ->
+    make_tag(8).
+
+make_tag(N) ->
+    B = base64:encode(crypto:strong_rand_bytes(N)),
+    binary_part(B, 0, N).
+
+new_attribute(Value, Map) ->
+    Key = make_tag(),
+    case maps:is_key(Key, Map) of
+        true ->
+            new_attribute(Value, Map);
+        false ->
+            {Key, Map#{Key => Value}}
+    end.
