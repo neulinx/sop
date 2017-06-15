@@ -2,13 +2,16 @@ CHANGELOG
 =========
 
 
-2.2.0
+devel
 -----
 
 - Add {new, Value} command. Generate unique attribute name and return it.
 - `new` request with key name reponse only `ok`.
 - Export `timestamp/0, make_tag/0, make_tag/1, new_attribute/2`.
 - `make reset` don't remove rebar.lock file.
+- Add helper functions for common messages.
+  - call, cast, stop.
+  - get, put, patch, new, delete.
 
 
 2.0.0

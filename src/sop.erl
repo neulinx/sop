@@ -26,9 +26,16 @@
 -export([start/1, start/2, start/3]).
 
 %%-- Helpers
--export([reply/2]).
+-export([reply/2,
+         call/2, call/3, call/4,
+         cast/2, cast/3,
+         stop/1, stop/2]).
+-export([get/1, get/2,
+         put/2, put/3,
+         patch/2, patch/3,
+         new/2, new/3,
+         delete/1, delete/2]).
 -export([timestamp/0, make_tag/0, make_tag/1, new_attribute/2]).
-
 
 %%- MACROS
 %%------------------------------------------------------------------------------
@@ -66,19 +73,23 @@
 
 %%-- Refined types.
 -type tag() :: atom() | string() | binary() | integer() | tuple().
--type code() :: 'ok' | 'error' | 'noreply' | 'stop' | 'unhandled' | tag().
+-type code() :: 'ok' | 'error' | 'noreply' | 'stop' |
+                'stopping' | 'unhandled' | tag().
 -type result() :: {any(), state()} |
                   {code(), any(), state()} |
                   {stop, Reason :: any(), Reply :: any(), state()}.
+-type reply() :: code() | {code(), Result :: any()}.
 
 %%-- Messages.
 -type signal() :: {'sos', command()} |
-                  {'sos', to(), command()} |
-                  {'sos', from(), to(), command()}.
--type to() :: list() | tag().
+                  {'sos', path(), command()} |
+                  {'sos', from(), path(), command()}.
+-type path() :: list() | tag().
 -type from() :: {pid(), reference()} | 'call' | 'cast'.
 -type command() :: method() | {method(), any()} | {'new', any(), any()} | any().
--type method() :: 'get' | 'put' | 'patch' | 'delete' | 'new' | tag().
+-type method() :: 'get' | 'put' | 'patch' | 'delete' | 'new' | 'stop' | tag().
+-type process() :: pid() | atom().
+-type target() :: process() | path().
 
 %%- Starts the server
 %%------------------------------------------------------------------------------
@@ -188,65 +199,216 @@ handle_info(Info, State) ->
         {ok, Do} ->
             case Do(Info, State) of
                 {unhandled, S} ->
-                    handle(Info, S);
+                    {Result, Caller} = handle(Info, S),
+                    response(Result, Caller);
                 Res0 ->
                     Res0
             end;
         error ->
-            handle(Info, State)
+            {Result, Caller} = handle(Info, State),
+            response(Result, Caller)
     end.
 
+%% This function is called by a gen_server when it is about to terminate. It
+%% should be the opposite of Module:init/1 and do any necessary cleaning
+%% up. When it returns, the gen_server terminates with Reason. The return value
+%% is ignored.
+%% 
+%% -callback terminate(Reason :: (normal | shutdown | {shutdown, term()} |
+%%                                term()),
+%%                     State :: term()) ->
+%%     term().
+
+terminate(Reason, #{exit := Exit} = State) ->
+    Exit(Reason, State#{exit_time => timestamp()});
+terminate(_Reason, _State) ->
+    ok.
+
+%% Convert process state when code is changed
+%%
+%% -callback code_change(OldVsn :: (term() | {down, term()}), State :: term(),
+%%                       Extra :: term()) ->
+%%     {ok, NewState :: term()} | {error, Reason :: term()}.
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+%%- Message processing.
+%%------------------------------------------------------------------------------
+-spec reply({tag(), reference()}, Reply :: any()) -> 'ok'.
+reply({To, Tag}, Reply) ->
+    catch To ! {Tag, Reply},
+    ok;
+reply(_, _) ->
+    ok.
+
+-spec call(target(), Request :: any()) -> reply().
+call([Process | Path], Command) ->
+    call(Process, Path, Command, ?DFL_TIMEOUT);
+call(Process, Command) ->
+    call(Process, [], Command, ?DFL_TIMEOUT).
+
+-spec call(target(), Request :: any(), timeout()) -> reply().
+call([Process | Path], Command, Timeout) ->
+    call(Process, Path, Command, Timeout);
+call(Process, Command, Timeout) ->
+    call(Process, [], Command, Timeout).
+
+-spec call(process(), path(), Request :: any(), timeout()) -> reply().
+call(Process, Path, Command, Timeout) ->
+    Mref = monitor(process, Process),
+    Tag = make_ref(),
+    Process ! {sos, {self(), Tag}, Path, Command},
+    receive
+        {Tag, Result} ->
+            demonitor(Mref, [flush]),
+            Result;
+        {'DOWN', Mref, _, _, Reason} ->
+            {stopped, Reason}
+    after
+        Timeout ->
+            demonitor(Mref, [flush]),
+            {error, timeout}
+    end.
+
+-spec cast(target(), Message :: any()) -> 'ok'.
+cast([Process | Path], Command) ->
+    cast(Process, Path, Command);
+cast(Process, Command) ->
+    cast(Process, [], Command).
+
+-spec cast(process(), path(), Message :: any()) -> 'ok'.
+cast(Process, Path, Message) ->
+    catch Process ! {sos, cast, Path, Message},
+    ok.
+
+%%-- Data access.
+%%------------------------------------------------------------------------------
+-spec get(path()) -> result().
+get(Path) ->
+    call(Path, get).
+
+-spec get(path(), Options :: any()) -> result().
+get(Path, Options) ->
+    call(Path, {get, Options}).
+
+-spec put(path(), Value :: any()) -> result().
+put(Path, Value) ->
+    call(Path, {put, Value}).
+
+-spec put(path(), Value :: any(), Options :: any()) -> result().
+put(Path, Value, Options) ->
+    call(Path, {put, Value, Options}).
+
+-spec patch(path(), Value :: any()) -> result().
+patch(Path, Value) ->
+    call(Path, {patch, Value}).
+
+-spec patch(path(), Value :: any(), Options :: any()) -> result().
+patch(Path, Value, Options) ->
+    call(Path, {patch, Value, Options}).
+
+-spec new(path(), Value :: any()) -> result().
+new(Path, Value) ->
+    call(Path, {new, Value}).
+
+-spec new(path(), tag(), Value :: any()) -> result().
+new(Path, Key, Value) ->
+    call(Path, {new, Key, Value}).
+
+-spec delete(path()) -> result().
+delete(Path) ->
+    call(Path, delete).
+
+-spec delete(path(), Options :: any()) -> result().
+delete(Path, Options) ->
+    call(Path, {delete, Options}).
+
+%%-- Operations.
+%%------------------------------------------------------------------------------
+-spec stop(target()) -> result().
+stop(Path) ->
+    call(Path, stop).
+
+-spec stop(target(), Reason :: any()) -> result().
+stop(Path, Reason) ->
+    call(Path, {stop, Reason}).
+
+%%- Miscellaneous
+%%------------------------------------------------------------------------------
+timestamp() ->
+    erlang:system_time(micro_seconds).
+
+make_tag() ->
+    make_tag(8).
+
+make_tag(N) ->
+    B = base64:encode(crypto:strong_rand_bytes(N)),
+    binary_part(B, 0, N).
+
+new_attribute(Value, Map) ->
+    Key = make_tag(),
+    case maps:is_key(Key, Map) of
+        true ->
+            new_attribute(Value, Map);
+        false ->
+            {Key, Map#{Key => Value}}
+    end.
+
+%%- Internal functions.
+%%------------------------------------------------------------------------------
 %%-- sop messages.
 handle({sos, From, To, Command}, State) ->
-    request(To, Command, From, State);
+    {request(Command, To, From, State), From};
 handle({sos, From, Command}, State) ->
-    request([], Command, From, State);
+    {request(Command, [], From, State), From};
 handle({sos, Command}, State) ->
-    request([], Command, cast, State);
-%%-- drop unknown messages.
+    {request(Command, [], cast, State), cast};
+%% drop unknown messages.
 handle(_, State) ->
-    {noreply, State}.
+    {{noreply, State}, undefined}.
 
-%% Invoke at root of actor.
-request(Command, [], From, State) ->
+%%-- Reply and normalize result of request.
+response({noreply, _} = Noreply, _) ->
+    Noreply;
+response({Reply, NewState}, Caller) ->
+    reply(Caller, Reply),
+    {noreply, NewState};
+response({noreply, _, _} = Noreply, _) ->
+    Noreply;
+response({stop, _, _} = Stop, Caller) ->
+    reply(Caller, stopping),
+    Stop;
+response({stop, Reason, Reply, NewState}, Caller) ->
+    reply(Caller, Reply),
+    {stop, Reason, NewState};
+response({Code, Res, NewState}, Caller) ->
+    reply(Caller, {Code, Res}),
+    {noreply, NewState}.
+
+%% Invoke on root of actor.
+request(stop, [], _, State) ->
+    {stop, normal, State};
+request({stop, Reason}, [], _, State) ->
+    {stop, Reason, State};
+request(Command, [], _, State) ->
     case access(Command, [], State) of
         {result, Res} ->
-            reply(From, Res),
-            {noreply, State};
+            {Res, State};
         {update, Reply, NewS} when (not is_tuple(Command));
                                    element(1, Command) =/= put ->
-            reply(From, Reply),
-            {noreply, NewS};
+            {Reply, NewS};
         _ ->
-            reply(From, {error, badarg}),
-            {noreply, State}
+            {error, badarg, State}
     end;
 %% Branches and sprig.
 request(Command, To, From, State) ->
     case access(Command, To, State) of
         {result, Res} ->
-            reply(From, Res),
-            {noreply, State};
+            {Res, State};
         {update, Reply, NewState} ->
-            reply(From, Reply),
-            {noreply, NewState};
+            {Reply, NewState};
         {action, Func, Route} ->
-            case perform(Func, Command, Route, From, State) of
-                {noreply, _} = Result ->
-                    Result;
-                {noreply, _, _} = Result ->
-                    Result;
-                {stop, _, _} = Result ->
-                    Result;
-                {stop, _, _, _} = Result ->
-                    Result;
-                {Reply, NewState} ->
-                    reply(From, Reply),
-                    {noreply, NewState};
-                {Code, Res, NewState} ->
-                    reply(From, {Code, Res}),
-                    {noreply, NewState}
-            end;
+            perform(Func, Command, Route, From, State);
         {actor, Pid, Sprig} ->
             catch Pid ! {sos, From, Sprig, Command},
             {noreply, State};
@@ -303,54 +465,3 @@ perform(Func, Command, Sprig, _, State) when is_function(Func, 3) ->
 perform(Func, Command, Sprig, From, State) ->
     Func(Command, Sprig, From, State).
 
--spec reply({tag(), reference()}, Reply :: any()) -> 'ok'.
-reply({To, Tag}, Reply) ->
-    catch To ! {Tag, Reply},
-    ok;
-reply(_, _) ->
-    ok.
-
-%% This function is called by a gen_server when it is about to terminate. It
-%% should be the opposite of Module:init/1 and do any necessary cleaning
-%% up. When it returns, the gen_server terminates with Reason. The return value
-%% is ignored.
-%% 
-%% -callback terminate(Reason :: (normal | shutdown | {shutdown, term()} |
-%%                                term()),
-%%                     State :: term()) ->
-%%     term().
-
-terminate(Reason, #{exit := Exit} = State) ->
-    Exit(Reason, State#{exit_time => timestamp()});
-terminate(_Reason, _State) ->
-    ok.
-
-%% Convert process state when code is changed
-%%
-%% -callback code_change(OldVsn :: (term() | {down, term()}), State :: term(),
-%%                       Extra :: term()) ->
-%%     {ok, NewState :: term()} | {error, Reason :: term()}.
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
-
-
-%%- Miscellaneous.
-%%------------------------------------------------------------------------------
-timestamp() ->
-    erlang:system_time(micro_seconds).
-
-make_tag() ->
-    make_tag(8).
-
-make_tag(N) ->
-    B = base64:encode(crypto:strong_rand_bytes(N)),
-    binary_part(B, 0, N).
-
-new_attribute(Value, Map) ->
-    Key = make_tag(),
-    case maps:is_key(Key, Map) of
-        true ->
-            new_attribute(Value, Map);
-        false ->
-            {Key, Map#{Key => Value}}
-    end.
