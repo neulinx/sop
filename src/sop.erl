@@ -16,26 +16,76 @@
 
 %%- APIs
 %%------------------------------------------------------------------------------
-%%-- gen_server callbacks
+%%-- Framework.
+%% gen_server callbacks.
 -behaviour(gen_server).
--export([init/1, handle_call/3, handle_cast/2, handle_info/2,
-         terminate/2, code_change/3]).
+-export([init/1,
+         handle_call/3,
+         handle_cast/2,
+         handle_info/2,
+         terminate/2,
+         code_change/3
+        ]).
 
-%%-- Launcher and creator.
--export([start_link/1, start_link/2, start_link/3]).
--export([start/1, start/2, start/3]).
+%% Launcher.
+-export([start/1, start/2, start/3,
+         start_link/1, start_link/2, start_link/3
+        ]).
+%% Creator.
+-export([create/1, create/2,
+         from_module/2
+        ]).
 
-%%-- Helpers
+%%-- Message helpers.
+%% Generic.
 -export([reply/2,
          call/2, call/3, call/4,
-         cast/2, cast/3,
-         stop/1, stop/2]).
--export([get/1, get/2,
+         cast/2, cast/3
+        ]).
+
+%% Operations.
+-export([stop/1, stop/2,
+         subscribe/1, subscribe/2,
+         unsubscribe/2,
+         notify/2
+        ]).
+
+%% Access.
+-export([touch/1, touch/2,
+         get/1, get/2,
          put/2, put/3,
          patch/2, patch/3,
          new/2, new/3,
-         delete/1, delete/2]).
--export([timestamp/0, make_tag/0, make_tag/1, new_attribute/2]).
+         delete/1, delete/2
+        ]).
+
+%%-- Miscellanous.
+%% Tags.
+-export([timestamp/0,
+         make_tag/0, make_tag/1,
+         new_attribute/2
+        ]).
+
+%%-- Internal operations.
+%% Path or sequence.
+-export([chain/2,
+         chain_action/3, chain_action/4,
+         chain_react/3,
+         merge/2
+        ]).
+%% Internal process.
+-export([handle/2,
+         invoke/3,
+         attach/2, attach/3,
+         detach/2
+        ]).
+
+%%-- Actions
+-export([links/3,
+         monitors/3,
+         subscribers/3
+        ]).
+
 
 %%- MACROS
 %%------------------------------------------------------------------------------
@@ -65,8 +115,8 @@
 
 %%-- Attributes types.
 -type dynamic_attribute() :: map() | function() | pid().
--type entry_fun() :: fun((state()) -> result()).
--type exit_fun() :: fun((state()) -> result()).
+-type entry_fun() :: fun((state()) -> state()).
+-type exit_fun() :: fun((state()) -> state()).
 -type do_fun() :: fun((signal() | any(), state()) -> result()).
 -type timestamp() :: integer().  % by unit of microseconds.
 -type status() :: 'running' | tag().
@@ -75,10 +125,10 @@
 -type tag() :: atom() | string() | binary() | integer() | tuple().
 -type code() :: 'ok' | 'error' | 'noreply' | 'stop' |
                 'stopping' | 'unhandled' | tag().
--type result() :: {any(), state()} |
-                  {code(), any(), state()} |
-                  {stop, Reason :: any(), Reply :: any(), state()}.
 -type reply() :: code() | {code(), Result :: any()}.
+-type result() :: {reply(), state()} |
+                  {stop, Reason :: any(), state()} |
+                  {stop, Reason :: any(), reply(), state()}.
 
 %%-- Messages.
 -type signal() :: {'sos', command()} |
@@ -87,9 +137,19 @@
 -type path() :: list() | tag().
 -type from() :: {pid(), reference()} | 'call' | 'cast'.
 -type command() :: method() | {method(), any()} | {'new', any(), any()} | any().
--type method() :: 'get' | 'put' | 'patch' | 'delete' | 'new' | 'stop' | tag().
+-type method() :: 'touch' |
+                  'get' |
+                  'put' |
+                  'patch' |
+                  'delete' |
+                  'new' |
+                  'stop' |
+                  tag().
 -type process() :: pid() | atom().
 -type target() :: process() | path().
+
+%%-- actors
+-type actor_type() :: 'generic' | 'actor' | 'fsm'.
 
 %%- Starts the server
 %%------------------------------------------------------------------------------
@@ -137,6 +197,74 @@ merge_options(Options, State) ->
             Options ++ [{timeout, Timeout}]
     end.
 
+-spec create(actor_type()) -> state().
+create(Type) ->
+    create(Type, #{}).
+
+-spec create(actor_type() | module(), map()) -> state().
+create(actor, Data) ->
+    S = Data#{subscribers => fun subscribers/3,
+              links => fun links/3,
+              monitors => fun monitors/3
+             },
+    S1 = chain_action(S, do, fun actor_do/2),
+    chain_action(S1, exit, fun actor_exit/1);
+create(generic, Data) ->
+    Data;
+create(Module, Data) ->
+    from_module(Module, Data).
+
+-spec from_module(module(), map()) -> state().
+from_module(Module, Data) ->
+    case erlang:function_exported(Module, create, 1) of
+        true ->
+            Module:create(Data);
+        _ ->
+            A1 = case erlang:function_exported(Module, entry, 1) of
+                     true->
+                         chain_action(Data, entry, fun Module:entry/1);
+                     false ->
+                         Data
+                 end,
+            A2 = case erlang:function_exported(Module, do, 2) of
+                     true->
+                         chain_action(A1, do, fun Module:do/2);
+                     false ->
+                         A1
+                 end,
+            case erlang:function_exported(Module, exit, 1) of
+                true->
+                    chain_action(A2, exit, fun Module:exit/1);
+                false ->
+                    A2
+            end
+    end.
+
+-spec merge(state(), state()) -> state().
+merge(State1, State2) ->
+    case maps:take(entry, State2) of
+        error ->
+            S11 = State1,
+            S21 = State2;
+        {Entry, S21} ->
+            S11 = chain_action(State1, entry, Entry)
+    end,
+    case maps:take(do, S21) of
+        error ->
+            S12 = S11,
+            S22 = S21;
+        {Do, S22} ->
+            S12 = chain_action(S11, do, Do)
+    end,
+    case maps:take(exit, S22) of
+        error ->
+            S13 = S12,
+            S23 = S22;
+        {Exit, S23} ->
+            S13 = chain_action(S12, exit, Exit)
+    end,
+    maps:merge(S13, S23).
+
 %% gen_server callbacks
 %%------------------------------------------------------------------------------
 %% Initializes the server
@@ -145,17 +273,23 @@ merge_options(Options, State) ->
 %%     {stop, Reason :: term()} | ignore.
 init(State) ->
     process_flag(trap_exit, true),
+    self() ! sos_enter,
     S0 = #{entry_time => timestamp(),
            pid => self(),
            status => running,
            timeout => ?DFL_TIMEOUT},
     S1 = maps:merge(S0, State),
-    on_entry(S1).
-
-on_entry(#{entry := Entry} = State) ->
-    Entry(State);
-on_entry(State) ->
-    {ok, State}.
+    %% try...catch for gen_server cleanup.
+    try
+        on_entry(S1)
+    catch
+        throw: Reason ->
+            {stop, Reason};
+        exit: Reason ->
+            {stop, Reason};
+        error: Error ->
+            {stop, {error, Error}}
+    end.
 
 %% Handling sync call messages.
 %% 
@@ -195,18 +329,11 @@ handle_cast(Method, State) ->
 %%     {noreply, NewState :: term(), timeout() | hibernate} |
 %%     {stop, Reason :: term(), NewState :: term()}.
 handle_info(Info, State) ->
-    case maps:find(do, State) of
-        {ok, Do} ->
-            case Do(Info, State) of
-                {unhandled, S} ->
-                    {Result, Caller} = handle(Info, S),
-                    response(Result, Caller);
-                Res0 ->
-                    Res0
-            end;
-        error ->
-            {Result, Caller} = handle(Info, State),
-            response(Result, Caller)
+    case chain_react(do, Info, State) of
+        {unhandled, S} ->
+            handle(Info, S);
+        Result ->
+            Result
     end.
 
 %% This function is called by a gen_server when it is about to terminate. It
@@ -219,10 +346,8 @@ handle_info(Info, State) ->
 %%                     State :: term()) ->
 %%     term().
 
-terminate(Reason, #{exit := Exit} = State) ->
-    Exit(Reason, State#{exit_time => timestamp()});
-terminate(_Reason, _State) ->
-    ok.
+terminate(Reason, State) ->
+    on_exit(State#{reason => Reason, exit_time => timestamp()}).
 
 %% Convert process state when code is changed
 %%
@@ -283,68 +408,102 @@ cast(Process, Path, Message) ->
 
 %%-- Data access.
 %%------------------------------------------------------------------------------
--spec get(path()) -> result().
+%% To check existence of an attribute. Return summary of the attribute or
+%% {error, undefined} if it is not existed.
+-spec touch(path()) -> reply().
+touch(Path) ->
+    call(Path, touch).
+
+-spec touch(path(), Options :: any()) -> reply().
+touch(Path, Options) ->
+    call(Path, {touch, Options}).
+
+-spec get(path()) -> reply().
 get(Path) ->
     call(Path, get).
 
--spec get(path(), Options :: any()) -> result().
+-spec get(path(), Options :: any()) -> reply().
 get(Path, Options) ->
     call(Path, {get, Options}).
 
--spec put(path(), Value :: any()) -> result().
+-spec put(path(), Value :: any()) -> reply().
 put(Path, Value) ->
     call(Path, {put, Value}).
 
--spec put(path(), Value :: any(), Options :: any()) -> result().
+-spec put(path(), Value :: any(), Options :: any()) -> reply().
 put(Path, Value, Options) ->
     call(Path, {put, Value, Options}).
 
--spec patch(path(), Value :: any()) -> result().
+-spec patch(path(), Value :: any()) -> reply().
 patch(Path, Value) ->
     call(Path, {patch, Value}).
 
--spec patch(path(), Value :: any(), Options :: any()) -> result().
+-spec patch(path(), Value :: any(), Options :: any()) -> reply().
 patch(Path, Value, Options) ->
     call(Path, {patch, Value, Options}).
 
--spec new(path(), Value :: any()) -> result().
+-spec new(path(), Value :: any()) -> reply().
 new(Path, Value) ->
     call(Path, {new, Value}).
 
--spec new(path(), tag(), Value :: any()) -> result().
+-spec new(path(), tag(), Value :: any()) -> reply().
 new(Path, Key, Value) ->
     call(Path, {new, Key, Value}).
 
--spec delete(path()) -> result().
+-spec delete(path()) -> reply().
 delete(Path) ->
     call(Path, delete).
 
--spec delete(path(), Options :: any()) -> result().
+-spec delete(path(), Options :: any()) -> reply().
 delete(Path, Options) ->
     call(Path, {delete, Options}).
 
 %%-- Operations.
 %%------------------------------------------------------------------------------
--spec stop(target()) -> result().
+-spec subscribe(path()) -> reply().
+subscribe(Path) ->
+    Target = chain(Path, subscribers),
+    call(Target, {new, self()}).
+
+-spec subscribe(path(), pid()) -> reply().
+subscribe(Path, Pid) ->
+    Target = chain(Path, subscribers),
+    call(Target, {new, Pid}).
+
+-spec unsubscribe(path(), reference()) -> reply().
+unsubscribe(Path, Ref) ->
+    Target = chain(Path, [subscribers, Ref]),
+    call(Target, delete).
+
+-spec notify(path(), Info :: any()) -> reply().
+notify(Path, Info) ->
+    Target = chain(Path, subscribers),
+    call(Target, {notify, Info}).
+
+-spec stop(target()) -> reply().
 stop(Path) ->
     call(Path, stop).
 
--spec stop(target(), Reason :: any()) -> result().
+-spec stop(target(), Reason :: any()) -> reply().
 stop(Path, Reason) ->
     call(Path, {stop, Reason}).
 
 %%- Miscellaneous
 %%------------------------------------------------------------------------------
+-spec timestamp() -> integer().
 timestamp() ->
     erlang:system_time(micro_seconds).
 
+-spec make_tag() -> binary().
 make_tag() ->
     make_tag(8).
 
+-spec make_tag(pos_integer()) -> binary().
 make_tag(N) ->
     B = base64:encode(crypto:strong_rand_bytes(N)),
     binary_part(B, 0, N).
 
+-spec new_attribute(Value :: any(), map()) -> {tag(), map()}.
 new_attribute(Value, Map) ->
     Key = make_tag(),
     case maps:is_key(Key, Map) of
@@ -354,36 +513,317 @@ new_attribute(Value, Map) ->
             {Key, Map#{Key => Value}}
     end.
 
+-spec chain_action(map(), tag(), function() | list()) -> map().
+chain_action(State, Name, Func) ->
+    chain_action(State, Name, Func, head).
+
+-spec chain_action(map(), tag(), function() | list(), 'head' | 'tail') -> map().
+chain_action(State, Name, Func, Pos) ->
+    case maps:find(Name, State) of
+        error ->
+            State#{Name => Func};
+        {ok, F} when Pos =:= head ->
+            State#{Name := chain(Func, F)};
+        {ok, F} when Pos =:= tail ->
+            State#{Name := chain(F, Func)}
+    end.
+
+-spec chain(Head :: any(), Tail :: any()) -> list().
+chain(Head, Tail) when is_list(Head) andalso is_list(Tail) ->
+    Head ++ Tail;
+chain(Head, Tail) when is_list(Head) ->
+    Head ++ [Tail];
+chain(Head, Tail) when is_list(Tail) ->
+    [Head | Tail];
+chain(Head, Tail) ->
+    [Head, Tail].
+
+-spec chain_react(tag(), Event :: any(), state()) -> result().
+chain_react(Attribute, Event, State) ->
+    case maps:find(Attribute, State) of
+        error ->
+            {unhandled, State};
+        {ok, Func} when is_function(Func) ->
+            Func(Event, State);
+        {ok, Stack} when is_list(Stack) ->
+            on_event(Stack, Event, State)
+    end.
+
+%%-- sop messages.
+-spec handle(Command :: any(), state()) -> result().
+handle({sos, From, To, Command}, State) ->
+    response(From, request(Command, To, From, State));
+handle({sos, From, Command}, State) ->
+    response(From, request(Command, [], From, State));
+handle({sos, Command}, State) ->
+    response(cast, request(Command, [], cast, State));
+%% Drop unknown messages. Nothing replied.
+handle(_, State) ->
+    {noreply, State}.
+
+%%- Internal state operation.
+-spec invoke(Command :: any(), path(), state()) -> result().
+invoke(Command, Path, State) ->
+    case access(Command, Path, State) of
+        {result, Res} ->
+            {Res, State};
+        {update, Reply, NewState} ->
+            {Reply, NewState};
+        {action, Func, Route} ->
+            perform(Func, Command, Route, call, State);
+        {actor, Pid, Sprig} ->
+            Tag = make_ref(),
+            Pid ! {sos, {self(), Tag}, Sprig, Command},
+            Timeout = maps:get(timeout, State, ?DFL_TIMEOUT),
+            receive
+                {Tag, Result} ->
+                    {Result, State}
+            after
+                Timeout ->
+                    {{error, timeout}, State}
+            end;
+        {delete, ok} ->
+            {{error, badarg}, State}
+    end.
+
+-spec attach(tag(), state()) -> result().
+attach(Key, State) ->
+    {_, S} = detach(Key, State),
+    Path = chain('_links', Key),
+    case invoke(get, Path, S) of
+        {{ok, Value}, S1} ->
+            attach(Key, Value, S1);
+        Error ->
+            Error
+    end.
+
+-spec attach(tag(), Value :: any(), state()) -> result().
+attach(Key, Pid, State) when is_pid(Pid) ->
+    %% Ignore result of monitors.
+    case invoke({new, Key, Pid}, [monitors], State) of
+        {_, S} ->
+            {ok, S#{Key => Pid}};
+        Stop ->
+            Stop
+    end;
+attach(Key, {state, S}, State) ->
+    S1 = S#{surname => Key, parent => self()},
+    case start_link(S1) of
+        {ok, Pid} ->
+            case invoke({new, Key, Pid}, [monitors], State) of
+                {_, State1} ->
+                    {ok, State1#{Key => Pid}};
+                Stop ->
+                    Stop
+            end;
+        Error ->
+            {Error, S1}
+    end;
+%% To accept pid or state data.
+attach(Key, {data, Value}, State) ->
+    {ok, State#{Key => Value}};
+attach(Key, Value, State) ->
+    {ok, State#{Key => Value}}.
+
+-spec detach(tag(), state()) -> result().
+detach(Key, State) ->
+    case invoke({delete, Key}, [monitors], State) of
+        {_, S} ->
+            {ok, maps:remove(Key, S)};
+        Stop ->
+            Stop
+    end.
+
+%%- Active attributes.
+%%------------------------------------------------------------------------------
+%%-- Subscription & notification.
+%% Introduced:
+%%  * 'subscribers': active attribute for subscription actions.
+%%  * '_subscribers': subscribers data cache.
+%%  * 'report_items': definition of output items when actor exit.
+-spec subscribers(Command :: any(), path(), state()) -> result().
+subscribers({new, Pid}, [], State) ->
+    Subs = maps:get('_subscribers', State, #{}),
+    Mref = monitor(process, Pid),
+    Subs1 = Subs#{Mref => Pid},
+    {ok, Mref, State#{'_subscribers' => Subs1}};
+subscribers(delete, [Mref], #{'_subscribers' := Subs} = State) ->
+    demonitor(Mref),
+    Subs1 = maps:remove(Mref, Subs),
+    {ok, State#{'_subscribers' := Subs1}};
+subscribers({notify, Info}, [], #{'_subscribers' := Subs} = State) ->
+    maps:fold(fun(M, P, _) -> catch P ! {M, Info} end, 0, Subs),
+    {ok, State};
+subscribers({notify, Info, remove}, [], #{'_subscribers' := Subs} = State) ->
+    maps:fold(fun(Mref, Pid, _) ->
+                      catch Pid ! {Mref, Info},
+                      demonitor(Mref)
+              end, 0, Subs),
+    {ok, maps:remove('_subscribers', State)};
+subscribers(_, _, State) ->
+    {{error, badarg}, State}.
+
+%%-- Links
+-spec links(Command :: any(), path(), state()) -> result().
+links(touch, Key, State) ->
+    attach(Key, State);
+links(get, Key, State) ->
+    case attach(Key, State) of
+        {ok, S} ->
+            {ok, maps:get(Key, S), S};
+        Error ->
+            Error
+    end;
+links({new, Target}, Key, State) ->
+    Path = chain('_links', Key),
+    case invoke({new, Target}, Path, State) of
+        {ok, S} ->
+            attach(Key, S);
+        Error ->
+            Error
+    end;
+links(delete, Key, State) ->
+    detach(Key, State);
+links(_, _, State) ->
+    {{error, badarg}, State}.
+
+-spec monitors(Command :: any(), path(), state()) -> result().
+monitors({get, Key}, [], #{'_monitors' := M} = State) ->
+    case maps:find(Key, M) of
+        error ->
+            {{error, undefined}, State};
+        Ok ->
+            {Ok, State}
+    end;
+monitors({new, Key, Pid}, [], State) ->
+    M = maps:get('_monitors', State, #{}),
+    Mref = monitor(process, Pid),
+    M1 = M#{Mref => Key, Key => Mref},
+    {{ok, Mref}, State#{'_monitors' => M1}};
+monitors({delete, all}, [], #{'_monitors' := M} = State) ->
+    maps:fold(fun(Mref, _, _) when is_reference(Mref) ->
+                      demonitor(Mref);
+                 (_, _, _) ->
+                      noop
+              end, 0, M),
+    maps:remove('_monitors', State);
+monitors({delete, Key}, [], #{'_monitors' := M} = State) ->
+    case maps:find(Key, M) of
+        {ok, Ref} when is_reference(Ref) ->
+            demonitor(Ref),
+            M1 = maps:remove(Key, M),
+            M2 = maps:remove(Ref, M1),
+            {{ok, Ref}, State#{'_monitors' := M2}};
+        {ok, Ref} when is_reference(Key) ->
+            demonitor(Key),
+            M1 = maps:remove(Key, M),
+            M2 = maps:remove(Ref, M1),
+            {{ok, Ref}, State#{'_monitors' := M2}};
+        error ->
+            {{error, undefined}, State}
+    end;
+monitors(get, [Key], State) ->
+    monitors({get, Key}, [], State);
+monitors({new, Pid}, [Key], State) ->
+    monitors({new, Key, Pid}, [], State);
+monitors(delete, [Key], State) ->
+    monitors({delete, Key}, [], State);
+monitors(_, _, State) ->
+    {{error, badarg}, State}.
+
+actor_do({sos, From, [Key | _], _} = Req, State) ->
+    case maps:find(Key, State) of
+        error ->
+            case invoke(touch, [states, Key], State) of
+                {ok, S} ->
+                    handle(Req, S);
+                {Error, S} ->
+                    reply(From, Error),
+                    {noreply, S};
+                Stop ->
+                    Stop
+            end;
+        _ ->
+            handle(Req, State)
+    end;
+actor_do({'DOWN', M, _, _, _}, State) ->
+    S = case maps:find('_subscribers', State) of
+            {ok, Subs} ->
+                Subs1 = maps:remove(M, Subs),
+                State#{'_subscribers' := Subs1};
+            error ->
+                State
+        end,
+    case invoke({delete, M}, [monitors], S) of
+        {{ok, Key}, S1} ->
+            {ok, maps:remove(Key, S1)};
+        {_, State} ->  % no change
+            {unhandled, State};
+        {_, S1} ->
+            {noreply, S1};
+        Stop ->
+            Stop
+    end;
+actor_do(_, State) ->
+    {unhandled, State}.
+
+%% Goodbye, subscribers! And submit leave report.
+actor_exit(State) ->
+    Detail = maps:get('report_items', State, []),
+    Report = make_report(Detail, State),
+    Info = {exit, Report},
+    {_, S} = invoke({notify, Info, remove}, [subscribers], State),
+    {_, S1} = invoke({delete, all}, [monitors], S),
+    S1.
+
 %%- Internal functions.
 %%------------------------------------------------------------------------------
-%%-- sop messages.
-handle({sos, From, To, Command}, State) ->
-    {request(Command, To, From, State), From};
-handle({sos, From, Command}, State) ->
-    {request(Command, [], From, State), From};
-handle({sos, Command}, State) ->
-    {request(Command, [], cast, State), cast};
-%% drop unknown messages.
-handle(_, State) ->
-    {{noreply, State}, undefined}.
+on_entry(#{entry := Entry} = State) when is_function(Entry) ->
+    Entry(State);
+on_entry(#{entry := Entry} = State) ->
+    lists:foldl(fun(F, S) -> F(S) end,
+                State,
+                Entry);
+on_entry(State) ->
+    State.
+
+on_exit(#{exit := Exit} = State) when is_function(Exit) ->
+    Exit(State);
+on_exit(#{exit := Exit} = State) ->
+    lists:foldl(fun(F, S) ->
+                        try
+                            F(S)
+                        catch
+                            _:_ -> S
+                        end
+                end,
+                State,
+                Exit);
+on_exit(State) ->
+    State.
+
+on_event([Do | Rest], Info, State) ->
+    case Do(Info, State) of
+        {unhandled, S} ->
+            on_event(Rest, Info, S);
+        Handled ->
+            Handled
+    end;
+on_event([], _, State) ->
+    {unhandled, State}.
 
 %%-- Reply and normalize result of request.
-response({noreply, _} = Noreply, _) ->
-    Noreply;
-response({Reply, NewState}, Caller) ->
+response(_, {noreply, NewState}) ->
+    {noreply, NewState};
+response(Caller, {Reply, NewState}) ->
     reply(Caller, Reply),
     {noreply, NewState};
-response({noreply, _, _} = Noreply, _) ->
-    Noreply;
-response({stop, _, _} = Stop, Caller) ->
+response(Caller, {stop, Reason, NewState}) ->
     reply(Caller, stopping),
-    Stop;
-response({stop, Reason, Reply, NewState}, Caller) ->
-    reply(Caller, Reply),
     {stop, Reason, NewState};
-response({Code, Res, NewState}, Caller) ->
-    reply(Caller, {Code, Res}),
-    {noreply, NewState}.
+response(Caller, {stop, Reason, Reply, NewState}) ->
+    reply(Caller, Reply),
+    {stop, Reason, NewState}.
 
 %% Invoke on root of actor.
 request(stop, [], _, State) ->
@@ -398,7 +838,7 @@ request(Command, [], _, State) ->
                                    element(1, Command) =/= put ->
             {Reply, NewS};
         _ ->
-            {error, badarg, State}
+            {{error, badarg}, State}
     end;
 %% Branches and sprig.
 request(Command, To, From, State) ->
@@ -411,17 +851,19 @@ request(Command, To, From, State) ->
             perform(Func, Command, Route, From, State);
         {actor, Pid, Sprig} ->
             catch Pid ! {sos, From, Sprig, Command},
-            {noreply, State};
-        _ ->
-            {error, badarg, State}
+            {noreply, State}
     end.
 
+access(touch, [], _) ->
+    {result, ok};
 access(get, [], Data) ->
     {result, {ok, Data}};
 access({put, Value}, [], _) ->
     {update, ok, Value};
 access(delete, [], _) ->
     {delete, ok};
+access({touch, Selection}, [], Data) ->
+    access({get, Selection}, [], Data);
 access({get, Selection}, [], Data)
   when is_list(Selection) andalso is_map(Data) ->
     Value = maps:with(Selection, Data),
@@ -465,3 +907,9 @@ perform(Func, Command, Sprig, _, State) when is_function(Func, 3) ->
 perform(Func, Command, Sprig, From, State) ->
     Func(Command, Sprig, From, State).
 
+%% Selective report.
+make_report(all, State) ->
+    State;
+%% Selections is a list of attributes to yield.
+make_report(Selections, State) when is_list(Selections) ->
+    maps:with(Selections, State).

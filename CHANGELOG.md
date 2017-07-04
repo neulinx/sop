@@ -11,7 +11,22 @@ devel
 - `make reset` don't remove rebar.lock file.
 - Add helper functions for common messages.
   - call, cast, stop.
-  - get, put, patch, new, delete.
+  - touch, get, put, patch, new, delete.
+- Add subscribers attribute and helpers.
+  - subscribe
+  - unsubscribe
+  - notify
+- Add links attribute and helpers.
+  - link
+  - unlink
+- Add monitors attribute.
+- Add internal operation functions for actor.
+  - `chain`, `chain_action`, `chain_react`
+  - `invoke`, `attach`, `detach`
+- Change result format.
+  - Non-stop message form should be {reply(), state()}.
+  - Error message should be {{error, Error}, state()}.
+- Export merge/2 function to combine two states of actors.
 
 
 2.0.0
