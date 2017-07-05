@@ -71,7 +71,8 @@
 -export([chain/2,
          chain_action/3, chain_action/4,
          chain_react/3,
-         merge/2
+         merge/2,
+         swap/1
         ]).
 %% Internal process.
 -export([handle/2,
@@ -131,9 +132,9 @@
                   {stop, Reason :: any(), reply(), state()}.
 
 %%-- Messages.
--type signal() :: {'sos', command()} |
-                  {'sos', path(), command()} |
-                  {'sos', from(), path(), command()}.
+-type signal() :: {'$$', command()} |
+                  {'$$', path(), command()} |
+                  {'$$', from(), path(), command()}.
 -type path() :: list() | tag().
 -type from() :: {pid(), reference()} | 'call' | 'cast'.
 -type command() :: method() | {method(), any()} | {'new', any(), any()} | any().
@@ -203,12 +204,13 @@ create(Type) ->
 
 -spec create(actor_type() | module(), map()) -> state().
 create(actor, Data) ->
-    S = Data#{subscribers => fun subscribers/3,
+    Actor = #{subscribers => fun subscribers/3,
               links => fun links/3,
-              monitors => fun monitors/3
+              monitors => fun monitors/3,
+              do => fun actor_do/2,
+              exit => fun actor_exit/1
              },
-    S1 = chain_action(S, do, fun actor_do/2),
-    chain_action(S1, exit, fun actor_exit/1);
+    merge(Actor, Data);
 create(generic, Data) ->
     Data;
 create(Module, Data) ->
@@ -222,19 +224,19 @@ from_module(Module, Data) ->
         _ ->
             A1 = case erlang:function_exported(Module, entry, 1) of
                      true->
-                         chain_action(Data, entry, fun Module:entry/1);
+                         chain_action(Data, entry, fun Module:entry/1, tail);
                      false ->
                          Data
                  end,
             A2 = case erlang:function_exported(Module, do, 2) of
                      true->
-                         chain_action(A1, do, fun Module:do/2);
+                         chain_action(A1, do, fun Module:do/2, tail);
                      false ->
                          A1
                  end,
             case erlang:function_exported(Module, exit, 1) of
                 true->
-                    chain_action(A2, exit, fun Module:exit/1);
+                    chain_action(A2, exit, fun Module:exit/1, tail);
                 false ->
                     A2
             end
@@ -271,9 +273,13 @@ merge(State1, State2) ->
 %% -callback init(Args :: term()) ->
 %%     {ok, State :: term()} | {ok, State :: term(), timeout() | hibernate} |
 %%     {stop, Reason :: term()} | ignore.
+init(#{status := running} = State) ->
+    process_flag(trap_exit, true),
+    self() ! '$$resume',
+    {ok, State};
 init(State) ->
     process_flag(trap_exit, true),
-    self() ! sos_enter,
+    self() ! '$$enter',
     S0 = #{entry_time => timestamp(),
            pid => self(),
            status => running,
@@ -281,7 +287,7 @@ init(State) ->
     S1 = maps:merge(S0, State),
     %% try...catch for gen_server cleanup.
     try
-        on_entry(S1)
+        {ok, on_entry(S1)}
     catch
         throw: Reason ->
             {stop, Reason};
@@ -302,11 +308,11 @@ init(State) ->
 %%     {stop, Reason :: term(), Reply :: term(), NewState :: term()} |
 %%     {stop, Reason :: term(), NewState :: term()}.
 handle_call({To, Method, Args}, From, State) ->
-    handle_info({sos, From, To, {Method, Args}}, State);
+    handle_info({'$$', From, To, {Method, Args}}, State);
 handle_call({To, Method}, From, State) ->
-    handle_info({sos, From, To, Method}, State);
+    handle_info({'$$', From, To, Method}, State);
 handle_call(Method, From, State) ->
-    handle_info({sos, From, [], Method}, State).
+    handle_info({'$$', From, [], Method}, State).
 
 
 %% Handling async cast messages.
@@ -316,11 +322,11 @@ handle_call(Method, From, State) ->
 %%     {noreply, NewState :: term(), timeout() | hibernate} |
 %%     {stop, Reason :: term(), NewState :: term()}.
 handle_cast({To, Method, Args}, State) ->
-    handle_info({sos, cast, To, {Method, Args}}, State);
+    handle_info({'$$', cast, To, {Method, Args}}, State);
 handle_cast({To, Method}, State) ->
-    handle_info({sos, cast, To, Method}, State);
+    handle_info({'$$', cast, To, Method}, State);
 handle_cast(Method, State) ->
-    handle_info({sos, cast, [], Method}, State).
+    handle_info({'$$', cast, [], Method}, State).
 
 %% Handling normal messages.
 %% 
@@ -382,7 +388,7 @@ call(Process, Command, Timeout) ->
 call(Process, Path, Command, Timeout) ->
     Mref = monitor(process, Process),
     Tag = make_ref(),
-    Process ! {sos, {self(), Tag}, Path, Command},
+    Process ! {'$$', {self(), Tag}, Path, Command},
     receive
         {Tag, Result} ->
             demonitor(Mref, [flush]),
@@ -403,7 +409,7 @@ cast(Process, Command) ->
 
 -spec cast(process(), path(), Message :: any()) -> 'ok'.
 cast(Process, Path, Message) ->
-    catch Process ! {sos, cast, Path, Message},
+    catch Process ! {'$$', cast, Path, Message},
     ok.
 
 %%-- Data access.
@@ -551,11 +557,11 @@ chain_react(Attribute, Event, State) ->
 
 %%-- sop messages.
 -spec handle(Command :: any(), state()) -> result().
-handle({sos, From, To, Command}, State) ->
+handle({'$$', From, To, Command}, State) ->
     response(From, request(Command, To, From, State));
-handle({sos, From, Command}, State) ->
+handle({'$$', From, Command}, State) ->
     response(From, request(Command, [], From, State));
-handle({sos, Command}, State) ->
+handle({'$$', Command}, State) ->
     response(cast, request(Command, [], cast, State));
 %% Drop unknown messages. Nothing replied.
 handle(_, State) ->
@@ -573,7 +579,7 @@ invoke(Command, Path, State) ->
             perform(Func, Command, Route, call, State);
         {actor, Pid, Sprig} ->
             Tag = make_ref(),
-            Pid ! {sos, {self(), Tag}, Sprig, Command},
+            Pid ! {'$$', {self(), Tag}, Sprig, Command},
             Timeout = maps:get(timeout, State, ?DFL_TIMEOUT),
             receive
                 {Tag, Result} ->
@@ -633,6 +639,12 @@ detach(Key, State) ->
         Stop ->
             Stop
     end.
+
+-spec swap(state()) -> state().
+swap(#{'$state' := S} = Fsm) ->
+    S#{'$fsm' => maps:remove('$state', Fsm)};
+swap(#{'$fsm' := F} = State) ->
+    F#{'$state' => maps:remove('$fsm', State)}.
 
 %%- Active attributes.
 %%------------------------------------------------------------------------------
@@ -731,7 +743,7 @@ monitors(delete, [Key], State) ->
 monitors(_, _, State) ->
     {{error, badarg}, State}.
 
-actor_do({sos, From, [Key | _], _} = Req, State) ->
+actor_do({'$$', From, [Key | _], _} = Req, State) ->
     case maps:find(Key, State) of
         error ->
             case invoke(touch, [states, Key], State) of
@@ -775,6 +787,17 @@ actor_exit(State) ->
     {_, S} = invoke({notify, Info, remove}, [subscribers], State),
     {_, S1} = invoke({delete, all}, [monitors], S),
     S1.
+
+fsm_do('$$enter', #{'$state' := S} = Fsm) ->
+    State = on_entry(swap(Fsm)),
+    {ok, swap(State)};
+fsm_do('$$enter', Fsm) ->
+    Start = maps:get(start, Fsm, start),
+    {{ok, State}, Fsm1} = invoke(get, [states, Start], Fsm),
+    S = on_entry(State#{'$fsm' => Fsm1}),
+    swap(S);
+fsm_do(Info, #{'$state' := S} = Fsm) ->
+    case handle_info(Info, State) of
 
 %%- Internal functions.
 %%------------------------------------------------------------------------------
@@ -850,7 +873,7 @@ request(Command, To, From, State) ->
         {action, Func, Route} ->
             perform(Func, Command, Route, From, State);
         {actor, Pid, Sprig} ->
-            catch Pid ! {sos, From, Sprig, Command},
+            catch Pid ! {'$$', From, Sprig, Command},
             {noreply, State}
     end.
 
@@ -913,3 +936,43 @@ make_report(all, State) ->
 %% Selections is a list of attributes to yield.
 make_report(Selections, State) when is_list(Selections) ->
     maps:with(Selections, State).
+
+fsm_start(#{start := Start} = Fsm) ->
+    transition(Start, Fsm);
+fsm_start(#{'$state' := _} = Fsm) ->
+    enter_state(start, Fsm);
+fsm_start(Fsm) ->
+    transition(start, Fsm).
+
+transition(Sign, Fsm) ->
+    %% states should handle exceptions e.g. vertex of sign is not found.
+    case invoke(get, [states, Sign], Fsm) of
+         {{ok, State}, Fsm1} ->
+            enter_state(Sign, Fsm1#{'$state' => State});
+        Stop ->
+            stop_fsm(Stop)
+    end.
+
+enter_state(_, #{step := Step, max_steps := Max} = Fsm) when Step >= Max ->
+    {stop, {shutdown, exceed_max_steps}, Fsm};
+enter_state(Sign, Fsm) ->
+    try
+        S = on_entry(swap(Fsm)),
+        do_state('$$enter', S)
+    catch
+        C : E ->
+            transition({Sign, exception}, Fsm#{payload => {exception, {C, E}}})
+    end.
+
+do_state(Info, State) ->
+    case handle_info(Info, State) of
+        {Result, S} ->
+            {Result, swap(S)};
+        {stop, normal, S} ->
+            Sign = maps:get(sign, S, stop),
+            exit_state(Sign, swap(S));
+        {stop, Shutdown, S} ->
+            {stop, Shutdown, swap(S)}
+    end.
+
+exit_state(

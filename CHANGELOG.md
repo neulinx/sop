@@ -1,9 +1,19 @@
 CHANGELOG
 =========
 
+2017-7-5 Unfinished FSM behaviors
+---------------------------------
 
-devel
------
+- Make '$' as sop special flag or prefix.
+  - '$$' as sop message flag.
+  - '$enter' as state enter event.
+  - '$resume' as state resume or wakeup event.
+- When create actor, give priority to initial data to supersede attributes.
+- Add swap function for FSM/State switching.
+
+
+2017-7-4 Actor
+--------------
 
 - Add {new, Value} command. Generate unique attribute name and return it.
 - `new` request with key name reponse only `ok`.
@@ -29,8 +39,8 @@ devel
 - Export merge/2 function to combine two states of actors.
 
 
-2.0.0
------
+2.0.0 Generic actor with maximum flexibility
+--------------------------------------------
 
 - Skip 1.x.x version scheme to keep for xl_sop project.
 - Support attribute tree traverse.
