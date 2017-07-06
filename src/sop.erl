@@ -69,7 +69,8 @@
 %%-- Internal operations.
 %% Path or sequence.
 -export([chain/2,
-         chain_action/3, chain_action/4,
+         chain_action/3,
+         chain_actions/3,
          chain_react/3,
          merge/2,
          swap/1
@@ -91,6 +92,7 @@
 %%- MACROS
 %%------------------------------------------------------------------------------
 -define(DFL_TIMEOUT, 4000).
+-define(DFL_MAX_STEPS, infinity).  % self-destructure as brute self-heal.
 
 %%- Types.
 %%------------------------------------------------------------------------------
@@ -103,9 +105,9 @@
 -type start_opt() :: {'timeout', timeout()} |
                      {'spawn_opt', [proc_lib:spawn_option()]}.
 %%-- state.
--type state() :: #{'entry' => entry_fun(),
-                   'exit' => exit_fun(),
-                   'do' => do_fun(),
+-type state() :: #{'entry' => entry_fun() | [entry_fun()],
+                   'exit' => exit_fun() | [exit_fun()],
+                   'do' => do_fun() | [do_fun()],
                    'pid' => pid(),
                    'entry_time' => timestamp(),
                    'exit_time' => timestamp(),
@@ -150,7 +152,7 @@
 -type target() :: process() | path().
 
 %%-- actors
--type actor_type() :: 'generic' | 'actor' | 'fsm'.
+-type actor_type() :: 'stem' | 'actor' | 'fsm' | 'thing'.
 
 %%- Starts the server
 %%------------------------------------------------------------------------------
@@ -203,6 +205,14 @@ create(Type) ->
     create(Type, #{}).
 
 -spec create(actor_type() | module(), map()) -> state().
+%% stem: state().
+create(stem, Data) ->
+    Data;
+%% fsm: stem, $start, $state, $fsm, states, step, max_steps, sign, payload.
+create(fsm, Data) ->
+    chain_action(Data, do, fun fsm_do/2);
+%% actor: stem, subscribers, _subscribers, links, _links, monitors, _monitors,
+%% report_items, surname, parent.
 create(actor, Data) ->
     Actor = #{subscribers => fun subscribers/3,
               links => fun links/3,
@@ -211,8 +221,15 @@ create(actor, Data) ->
               exit => fun actor_exit/1
              },
     merge(Actor, Data);
-create(generic, Data) ->
-    Data;
+%% thing: stem, fsm, actor.
+create(thing, Data) ->
+    Thing = #{subscribers => fun subscribers/3,
+              links => fun links/3,
+              monitors => fun monitors/3,
+              do => [fun fsm_do/2, fun actor_do/2],
+              exit => fun actor_exit/1
+             },
+    merge(Thing, Data);
 create(Module, Data) ->
     from_module(Module, Data).
 
@@ -224,19 +241,19 @@ from_module(Module, Data) ->
         _ ->
             A1 = case erlang:function_exported(Module, entry, 1) of
                      true->
-                         chain_action(Data, entry, fun Module:entry/1, tail);
+                         chain_action(Data, entry, fun Module:entry/1);
                      false ->
                          Data
                  end,
             A2 = case erlang:function_exported(Module, do, 2) of
                      true->
-                         chain_action(A1, do, fun Module:do/2, tail);
+                         chain_action(A1, do, fun Module:do/2);
                      false ->
                          A1
                  end,
             case erlang:function_exported(Module, exit, 1) of
                 true->
-                    chain_action(A2, exit, fun Module:exit/1, tail);
+                    chain_action(A2, exit, fun Module:exit/1);
                 false ->
                     A2
             end
@@ -244,28 +261,8 @@ from_module(Module, Data) ->
 
 -spec merge(state(), state()) -> state().
 merge(State1, State2) ->
-    case maps:take(entry, State2) of
-        error ->
-            S11 = State1,
-            S21 = State2;
-        {Entry, S21} ->
-            S11 = chain_action(State1, entry, Entry)
-    end,
-    case maps:take(do, S21) of
-        error ->
-            S12 = S11,
-            S22 = S21;
-        {Do, S22} ->
-            S12 = chain_action(S11, do, Do)
-    end,
-    case maps:take(exit, S22) of
-        error ->
-            S13 = S12,
-            S23 = S22;
-        {Exit, S23} ->
-            S13 = chain_action(S12, exit, Exit)
-    end,
-    maps:merge(S13, S23).
+    State3 = chain_actions(State2, State1, [entry, do, exit]),
+    maps:merge(State1, State3).
 
 %% gen_server callbacks
 %%------------------------------------------------------------------------------
@@ -519,20 +516,26 @@ new_attribute(Value, Map) ->
             {Key, Map#{Key => Value}}
     end.
 
--spec chain_action(map(), tag(), function() | list()) -> map().
+-spec chain_action(state(), tag(), function() | list()) -> state().
 chain_action(State, Name, Func) ->
-    chain_action(State, Name, Func, head).
-
--spec chain_action(map(), tag(), function() | list(), 'head' | 'tail') -> map().
-chain_action(State, Name, Func, Pos) ->
     case maps:find(Name, State) of
         error ->
             State#{Name => Func};
-        {ok, F} when Pos =:= head ->
-            State#{Name := chain(Func, F)};
-        {ok, F} when Pos =:= tail ->
+        {ok, F} ->
             State#{Name := chain(F, Func)}
     end.
+
+-spec chain_actions(state(), state(), [tag()]) -> state().
+chain_actions(State1, State2, Actions) ->
+    Func = fun(Key, State) ->
+                   case maps:find(Key, State2) of
+                       {ok, Value} ->
+                           chain_action(State, Key, Value);
+                       error ->
+                           State
+                   end
+           end,
+    lists:foldl(Func, State1, Actions).
 
 -spec chain(Head :: any(), Tail :: any()) -> list().
 chain(Head, Tail) when is_list(Head) andalso is_list(Tail) ->
@@ -743,6 +746,7 @@ monitors(delete, [Key], State) ->
 monitors(_, _, State) ->
     {{error, badarg}, State}.
 
+%%!todo: support {proxy, target()} | {proxy, {pid(), path()}}.
 actor_do({'$$', From, [Key | _], _} = Req, State) ->
     case maps:find(Key, State) of
         error ->
@@ -788,16 +792,15 @@ actor_exit(State) ->
     {_, S1} = invoke({delete, all}, [monitors], S),
     S1.
 
-fsm_do('$$enter', #{'$state' := S} = Fsm) ->
-    State = on_entry(swap(Fsm)),
-    {ok, swap(State)};
-fsm_do('$$enter', Fsm) ->
-    Start = maps:get(start, Fsm, start),
-    {{ok, State}, Fsm1} = invoke(get, [states, Start], Fsm),
-    S = on_entry(State#{'$fsm' => Fsm1}),
-    swap(S);
-fsm_do(Info, #{'$state' := S} = Fsm) ->
-    case handle_info(Info, State) of
+%% If $state is present before FSM start, it is an introducer for flexible
+%% initialization.
+fsm_do(Info, #{'$state' := _} = Fsm) ->
+    do_state(Info, swap(Fsm));
+fsm_do('$$enter', #{'$start' := Start} = Fsm) ->
+    transition(Start, Fsm);
+fsm_do(_, Fsm) ->
+    {unhandled, Fsm}.
+
 
 %%- Internal functions.
 %%------------------------------------------------------------------------------
@@ -937,42 +940,48 @@ make_report(all, State) ->
 make_report(Selections, State) when is_list(Selections) ->
     maps:with(Selections, State).
 
-fsm_start(#{start := Start} = Fsm) ->
-    transition(Start, Fsm);
-fsm_start(#{'$state' := _} = Fsm) ->
-    enter_state(start, Fsm);
-fsm_start(Fsm) ->
-    transition(start, Fsm).
-
+%%!todo: archive historic states as traces.
+%%        {_, F1} = invoke({new, Fsm}, [traces], Fsm),            
 transition(Sign, Fsm) ->
-    %% states should handle exceptions e.g. vertex of sign is not found.
-    case invoke(get, [states, Sign], Fsm) of
-         {{ok, State}, Fsm1} ->
-            enter_state(Sign, Fsm1#{'$state' => State});
+    Step = maps:get(step, Fsm, 0),
+    F1 = Fsm#{step => Step + 1},
+    %% states should handle exceptions. For examples: vertex of sign is not
+    %% found or exceed max steps limited.
+    case invoke(get, [states, Sign], F1) of
+        {{ok, State}, F2} ->
+            enter_state(F2#{'$state' => State});
+        {Error, F2} ->
+            {stop, Error, F2};
         Stop ->
-            stop_fsm(Stop)
+            Stop
     end.
 
-enter_state(_, #{step := Step, max_steps := Max} = Fsm) when Step >= Max ->
+enter_state(#{step := Step, max_steps := Max} = Fsm) when Step >= Max ->
     {stop, {shutdown, exceed_max_steps}, Fsm};
-enter_state(Sign, Fsm) ->
+enter_state(Fsm) ->
     try
         S = on_entry(swap(Fsm)),
         do_state('$$enter', S)
     catch
         C : E ->
-            transition({Sign, exception}, Fsm#{payload => {exception, {C, E}}})
+            transition(exception, Fsm#{payload => {C, E}})
     end.
 
+%%!todo: {stop, {transition, NewState}, State}, be free & evil.
 do_state(Info, State) ->
     case handle_info(Info, State) of
         {Result, S} ->
             {Result, swap(S)};
         {stop, normal, S} ->
-            Sign = maps:get(sign, S, stop),
-            exit_state(Sign, swap(S));
+            try
+                S1 = on_exit(S),
+                Sign = maps:get(sign, S1, stop),
+                transition(Sign, swap(S1))
+            catch
+                C : E ->
+                    Fsm = swap(S),
+                    transition(exception, Fsm#{payload => {C, E}})
+            end;
         {stop, Shutdown, S} ->
             {stop, Shutdown, swap(S)}
     end.
-
-exit_state(

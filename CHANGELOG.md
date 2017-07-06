@@ -1,6 +1,17 @@
 CHANGELOG
 =========
 
+2.1.0 stem, fsm, actor and thing
+--------------------------------
+
+Updated version. But it is not stable version.
+
+- Remove `chain_action/4` and add `chain_actions/3`.
+- Fix dialyzer warning of state actions.
+- Creator now support stem, fsm, actor and thing.
+- Simplify merge/2 function with cost of `chain_actions`.
+- Simplify fsm behavior and finish it.
+
 2017-7-5 Unfinished FSM behaviors
 ---------------------------------
 
@@ -41,6 +52,33 @@ CHANGELOG
 
 2.0.0 Generic actor with maximum flexibility
 --------------------------------------------
+
+- Add {new, Value} command. Generate unique attribute name and return it.
+- `new` request with key name reponse only `ok`.
+- Export `timestamp/0, make_tag/0, make_tag/1, new_attribute/2`.
+- `make reset` don't remove rebar.lock file.
+- Add helper functions for common messages.
+  - call, cast, stop.
+  - touch, get, put, patch, new, delete.
+- Add subscribers attribute and helpers.
+  - subscribe
+  - unsubscribe
+  - notify
+- Add links attribute and helpers.
+  - link
+  - unlink
+- Add monitors attribute.
+- Add internal operation functions for actor.
+  - `chain`, `chain_action`, `chain_react`
+  - `invoke`, `attach`, `detach`
+- Change result format.
+  - Non-stop message form should be {reply(), state()}.
+  - Error message should be {{error, Error}, state()}.
+- Export merge/2 function to combine two states of actors.
+
+
+2.0.0
+-----
 
 - Skip 1.x.x version scheme to keep for xl_sop project.
 - Support attribute tree traverse.
