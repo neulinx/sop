@@ -1,6 +1,11 @@
 CHANGELOG
 =========
 
+2.1.1 Simplify reply and result format
+--------------------------------------
+
+- reply format of {ok, Result} is simplified to Result.
+
 2.1.0 stem, fsm, actor and thing
 --------------------------------
 

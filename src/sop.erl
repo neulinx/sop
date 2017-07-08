@@ -89,13 +89,16 @@
         ]).
 
 
-%%- MACROS
-%%------------------------------------------------------------------------------
--define(DFL_TIMEOUT, 4000).
--define(DFL_MAX_STEPS, infinity).  % self-destructure as brute self-heal.
-
 %%- Types.
 %%------------------------------------------------------------------------------
+-export_type([state/0,
+              reply/0,
+              result/0,
+              message/0,
+              from/0,
+              process/0
+             ]).
+
 %%-- Definitions for gen_server.
 -type server_name() :: {local, atom()} |
                        {global, atom()} |
@@ -120,23 +123,23 @@
 -type dynamic_attribute() :: map() | function() | pid().
 -type entry_fun() :: fun((state()) -> state()).
 -type exit_fun() :: fun((state()) -> state()).
--type do_fun() :: fun((signal() | any(), state()) -> result()).
+-type do_fun() :: fun((message() | any(), state()) -> result()).
 -type timestamp() :: integer().  % by unit of microseconds.
 -type status() :: 'running' | tag().
 
 %%-- Refined types.
--type tag() :: atom() | string() | binary() | integer() | tuple().
--type code() :: 'ok' | 'error' | 'noreply' | 'stop' |
-                'stopping' | 'unhandled' | tag().
--type reply() :: code() | {code(), Result :: any()}.
--type result() :: {reply(), state()} |
-                  {stop, Reason :: any(), state()} |
-                  {stop, Reason :: any(), reply(), state()}.
+-type tag() :: any().
+-type pass() :: 'ok' | 'noreply' | 'unhandled' | any().
+-type fail() :: {'error', Error :: any()}.
+-type reply() :: pass() | fail().
+-type stop() :: {'stop', Reason :: any(), state()} |
+                {'stop', Reason :: any(), reply(), state()}.
+-type result() :: {reply(), state()} | stop().
 
 %%-- Messages.
--type signal() :: {'$$', command()} |
-                  {'$$', path(), command()} |
-                  {'$$', from(), path(), command()}.
+-type message() :: {'$$', command()} |
+                   {'$$', path(), command()} |
+                   {'$$', from(), path(), command()}.
 -type path() :: list() | tag().
 -type from() :: {pid(), reference()} | 'call' | 'cast'.
 -type command() :: method() | {method(), any()} | {'new', any(), any()} | any().
@@ -153,6 +156,12 @@
 
 %%-- actors
 -type actor_type() :: 'stem' | 'actor' | 'fsm' | 'thing'.
+
+%%- MACROS
+%%------------------------------------------------------------------------------
+-define(DFL_TIMEOUT, 4000).
+-define(DFL_MAX_STEPS, infinity).  % self-destructure as brute self-heal.
+
 
 %%- Starts the server
 %%------------------------------------------------------------------------------
@@ -600,10 +609,12 @@ attach(Key, State) ->
     {_, S} = detach(Key, State),
     Path = chain('_links', Key),
     case invoke(get, Path, S) of
-        {{ok, Value}, S1} ->
+        {{error, _}, _} = Error ->
+            Error;
+        {Value, S1} ->
             attach(Key, Value, S1);
-        Error ->
-            Error
+        Stop ->
+            Stop
     end.
 
 -spec attach(tag(), Value :: any(), state()) -> result().
@@ -661,7 +672,7 @@ subscribers({new, Pid}, [], State) ->
     Subs = maps:get('_subscribers', State, #{}),
     Mref = monitor(process, Pid),
     Subs1 = Subs#{Mref => Pid},
-    {ok, Mref, State#{'_subscribers' => Subs1}};
+    {Mref, State#{'_subscribers' => Subs1}};
 subscribers(delete, [Mref], #{'_subscribers' := Subs} = State) ->
     demonitor(Mref),
     Subs1 = maps:remove(Mref, Subs),
@@ -685,17 +696,20 @@ links(touch, Key, State) ->
 links(get, Key, State) ->
     case attach(Key, State) of
         {ok, S} ->
-            {ok, maps:get(Key, S), S};
-        Error ->
-            Error
+            {maps:get(Key, S), S};
+        Exception ->
+            Exception
     end;
+%%!notice: anonymous link when Key is [].
 links({new, Target}, Key, State) ->
     Path = chain('_links', Key),
     case invoke({new, Target}, Path, State) of
-        {ok, S} ->
-            attach(Key, S);
-        Error ->
-            Error
+        {{error, _}, _} = Error ->
+            Error;
+        {NewKey, S} ->
+            attach(NewKey, S);
+        Stop ->
+            Stop
     end;
 links(delete, Key, State) ->
     detach(Key, State);
@@ -707,33 +721,33 @@ monitors({get, Key}, [], #{'_monitors' := M} = State) ->
     case maps:find(Key, M) of
         error ->
             {{error, undefined}, State};
-        Ok ->
-            {Ok, State}
+        {ok, Value} ->
+            {Value, State}
     end;
 monitors({new, Key, Pid}, [], State) ->
     M = maps:get('_monitors', State, #{}),
     Mref = monitor(process, Pid),
     M1 = M#{Mref => Key, Key => Mref},
-    {{ok, Mref}, State#{'_monitors' => M1}};
+    {Mref, State#{'_monitors' => M1}};
 monitors({delete, all}, [], #{'_monitors' := M} = State) ->
     maps:fold(fun(Mref, _, _) when is_reference(Mref) ->
                       demonitor(Mref);
                  (_, _, _) ->
                       noop
               end, 0, M),
-    maps:remove('_monitors', State);
+    {ok, maps:remove('_monitors', State)};
 monitors({delete, Key}, [], #{'_monitors' := M} = State) ->
     case maps:find(Key, M) of
         {ok, Ref} when is_reference(Ref) ->
             demonitor(Ref),
             M1 = maps:remove(Key, M),
             M2 = maps:remove(Ref, M1),
-            {{ok, Ref}, State#{'_monitors' := M2}};
+            {Ref, State#{'_monitors' := M2}};
         {ok, Ref} when is_reference(Key) ->
             demonitor(Key),
             M1 = maps:remove(Key, M),
             M2 = maps:remove(Ref, M1),
-            {{ok, Ref}, State#{'_monitors' := M2}};
+            {Ref, State#{'_monitors' := M2}};
         error ->
             {{error, undefined}, State}
     end;
@@ -771,12 +785,13 @@ actor_do({'DOWN', M, _, _, _}, State) ->
                 State
         end,
     case invoke({delete, M}, [monitors], S) of
-        {{ok, Key}, S1} ->
-            {ok, maps:remove(Key, S1)};
         {_, State} ->  % no change
             {unhandled, State};
-        {_, S1} ->
+        {{error, _}, S1} ->
+            %%!todo: log error message.
             {noreply, S1};
+        {Key, S1} ->
+            {noreply, maps:remove(Key, S1)};
         Stop ->
             Stop
     end;
@@ -883,7 +898,7 @@ request(Command, To, From, State) ->
 access(touch, [], _) ->
     {result, ok};
 access(get, [], Data) ->
-    {result, {ok, Data}};
+    {result, Data};
 access({put, Value}, [], _) ->
     {update, ok, Value};
 access(delete, [], _) ->
@@ -893,16 +908,16 @@ access({touch, Selection}, [], Data) ->
 access({get, Selection}, [], Data)
   when is_list(Selection) andalso is_map(Data) ->
     Value = maps:with(Selection, Data),
-    {result, {ok, Value}};
+    {result, Value};
 access({patch, Value}, [], Data)
   when is_map(Value) andalso is_map(Data) ->
     NewData = maps:merge(Data, Value),
     {update, ok, NewData};
 access({new, Key, Value}, [], Data) when is_map(Data) ->
-    {update, ok, Data#{Key => Value}};
+    {update, Key, Data#{Key => Value}};
 access({new, Value}, [], Data) when is_map(Data) ->
     {Key, NewData} = new_attribute(Value, Data),
-    {update, {ok, Key}, NewData};
+    {update, Key, NewData};
 access(Command, [Key | Rest], Data) when is_map(Data) ->
     case maps:find(Key, Data) of
         {ok, Value} ->
@@ -948,10 +963,10 @@ transition(Sign, Fsm) ->
     %% states should handle exceptions. For examples: vertex of sign is not
     %% found or exceed max steps limited.
     case invoke(get, [states, Sign], F1) of
-        {{ok, State}, F2} ->
+        {{error, _} = Error, F2} ->
+            {stop, {shutdown, Error}, F2};
+        {State, F2} ->
             enter_state(F2#{'$state' => State});
-        {Error, F2} ->
-            {stop, Error, F2};
         Stop ->
             Stop
     end.
@@ -969,19 +984,19 @@ enter_state(Fsm) ->
 
 %%!todo: {stop, {transition, NewState}, State}, be free & evil.
 do_state(Info, State) ->
-    case handle_info(Info, State) of
-        {Result, S} ->
-            {Result, swap(S)};
+    try handle_info(Info, State) of
+        {noreply, S} ->
+            {noreply, swap(S)};
+        {unhandled, S} ->
+            {unhandled, swap(S)};
         {stop, normal, S} ->
-            try
-                S1 = on_exit(S),
-                Sign = maps:get(sign, S1, stop),
-                transition(Sign, swap(S1))
-            catch
-                C : E ->
-                    Fsm = swap(S),
-                    transition(exception, Fsm#{payload => {C, E}})
-            end;
+            S1 = on_exit(S),
+            Sign = maps:get(sign, S1, stop),
+            transition(Sign, swap(S1));
         {stop, Shutdown, S} ->
             {stop, Shutdown, swap(S)}
+    catch
+        C : E ->
+            Fsm = swap(State),
+            transition(exception, Fsm#{payload => {C, E}})
     end.
