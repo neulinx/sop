@@ -1,6 +1,14 @@
 CHANGELOG
 =========
 
+2.2.0 New feature: proxy
+------------------------
+
+- `do` function may return {proxy, Pid, State}, means redirect current command
+  to other actor process.
+- Active attribute may return {proxy, Target, State}, means refer to other
+  attribute in the same actor or redirect to another actor attribute.
+
 2.1.1 Simplify reply and result format
 --------------------------------------
 

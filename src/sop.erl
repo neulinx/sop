@@ -51,8 +51,7 @@
         ]).
 
 %% Access.
--export([touch/1, touch/2,
-         get/1, get/2,
+-export([get/1, get/2,
          put/2, put/3,
          patch/2, patch/3,
          new/2, new/3,
@@ -134,17 +133,17 @@
 -type reply() :: pass() | fail().
 -type stop() :: {'stop', Reason :: any(), state()} |
                 {'stop', Reason :: any(), reply(), state()}.
--type result() :: {reply(), state()} | stop().
+-type proxy() :: {'proxy', target(), state()}.
+-type result() :: {reply(), state()} | proxy() | stop().
 
 %%-- Messages.
 -type message() :: {'$$', command()} |
                    {'$$', path(), command()} |
                    {'$$', from(), path(), command()}.
--type path() :: list() | tag().
+-type path() :: list().
 -type from() :: {pid(), reference()} | 'call' | 'cast'.
 -type command() :: method() | {method(), any()} | {'new', any(), any()} | any().
--type method() :: 'touch' |
-                  'get' |
+-type method() :: 'get' |
                   'put' |
                   'patch' |
                   'delete' |
@@ -152,7 +151,7 @@
                   'stop' |
                   tag().
 -type process() :: pid() | atom().
--type target() :: process() | path().
+-type target() :: process() | path() | {process(), path()}.
 
 %%-- actors
 -type actor_type() :: 'stem' | 'actor' | 'fsm' | 'thing'.
@@ -344,6 +343,9 @@ handle_info(Info, State) ->
     case chain_react(do, Info, State) of
         {unhandled, S} ->
             handle(Info, S);
+        {proxy, Proxy, S} ->
+            catch Proxy ! Info,
+            {noreply, S};
         Result ->
             Result
     end.
@@ -381,11 +383,15 @@ reply(_, _) ->
 -spec call(target(), Request :: any()) -> reply().
 call([Process | Path], Command) ->
     call(Process, Path, Command, ?DFL_TIMEOUT);
+call({Process, Path}, Command) ->
+    call(Process, Path, Command, ?DFL_TIMEOUT);
 call(Process, Command) ->
     call(Process, [], Command, ?DFL_TIMEOUT).
 
 -spec call(target(), Request :: any(), timeout()) -> reply().
 call([Process | Path], Command, Timeout) ->
+    call(Process, Path, Command, Timeout);
+call({Process, Path}, Command, Timeout) ->
     call(Process, Path, Command, Timeout);
 call(Process, Command, Timeout) ->
     call(Process, [], Command, Timeout).
@@ -410,6 +416,8 @@ call(Process, Path, Command, Timeout) ->
 -spec cast(target(), Message :: any()) -> 'ok'.
 cast([Process | Path], Command) ->
     cast(Process, Path, Command);
+cast({Process, Path}, Command) ->
+    cast(Process, Path, Command);
 cast(Process, Command) ->
     cast(Process, [], Command).
 
@@ -420,16 +428,6 @@ cast(Process, Path, Message) ->
 
 %%-- Data access.
 %%------------------------------------------------------------------------------
-%% To check existence of an attribute. Return summary of the attribute or
-%% {error, undefined} if it is not existed.
--spec touch(path()) -> reply().
-touch(Path) ->
-    call(Path, touch).
-
--spec touch(path(), Options :: any()) -> reply().
-touch(Path, Options) ->
-    call(Path, {touch, Options}).
-
 -spec get(path()) -> reply().
 get(Path) ->
     call(Path, get).
@@ -570,11 +568,11 @@ chain_react(Attribute, Event, State) ->
 %%-- sop messages.
 -spec handle(Command :: any(), state()) -> result().
 handle({'$$', From, To, Command}, State) ->
-    response(From, request(Command, To, From, State));
+    response(Command, From, request(Command, To, From, State));
 handle({'$$', From, Command}, State) ->
-    response(From, request(Command, [], From, State));
+    response(Command, From, request(Command, [], From, State));
 handle({'$$', Command}, State) ->
-    response(cast, request(Command, [], cast, State));
+    response(Command, cast, request(Command, [], cast, State));
 %% Drop unknown messages. Nothing replied.
 handle(_, State) ->
     {noreply, State}.
@@ -588,18 +586,15 @@ invoke(Command, Path, State) ->
         {update, Reply, NewState} ->
             {Reply, NewState};
         {action, Func, Route} ->
-            perform(Func, Command, Route, call, State);
-        {actor, Pid, Sprig} ->
-            Tag = make_ref(),
-            Pid ! {'$$', {self(), Tag}, Sprig, Command},
-            Timeout = maps:get(timeout, State, ?DFL_TIMEOUT),
-            receive
-                {Tag, Result} ->
-                    {Result, State}
-            after
-                Timeout ->
-                    {{error, timeout}, State}
+            %% Caller is call means neither aynchronous return nor proxy.
+            case perform(Func, Command, Route, call, State) of
+                {proxy, Proxy, S} ->
+                    proxy_call(Proxy, Command, S);
+                Result ->
+                    Result
             end;
+        {actor, Pid, Sprig} ->
+            state_call({Pid, Sprig}, Command, State);
         {delete, ok} ->
             {{error, badarg}, State}
     end.
@@ -691,8 +686,6 @@ subscribers(_, _, State) ->
 
 %%-- Links
 -spec links(Command :: any(), path(), state()) -> result().
-links(touch, Key, State) ->
-    attach(Key, State);
 links(get, Key, State) ->
     case attach(Key, State) of
         {ok, S} ->
@@ -707,7 +700,12 @@ links({new, Target}, Key, State) ->
         {{error, _}, _} = Error ->
             Error;
         {NewKey, S} ->
-            attach(NewKey, S);
+            case attach(NewKey, S) of
+                {ok, S1} ->
+                    {NewKey, S1};
+                Exception ->
+                    Exception
+            end;
         Stop ->
             Stop
     end;
@@ -760,16 +758,15 @@ monitors(delete, [Key], State) ->
 monitors(_, _, State) ->
     {{error, badarg}, State}.
 
-%%!todo: support {proxy, target()} | {proxy, {pid(), path()}}.
 actor_do({'$$', From, [Key | _], _} = Req, State) ->
     case maps:find(Key, State) of
         error ->
-            case invoke(touch, [states, Key], State) of
-                {ok, S} ->
-                    handle(Req, S);
-                {Error, S} ->
+            case invoke(get, [states, Key], State) of
+                {{error, _} = Error, S} ->
                     reply(From, Error),
                     {noreply, S};
+                {_, S} ->
+                    handle(Req, S);
                 Stop ->
                     Stop
             end;
@@ -854,17 +851,39 @@ on_event([], _, State) ->
     {unhandled, State}.
 
 %%-- Reply and normalize result of request.
-response(_, {noreply, NewState}) ->
+response(_, _, {noreply, NewState}) ->
     {noreply, NewState};
-response(Caller, {Reply, NewState}) ->
+response(_, Caller, {Reply, NewState}) ->
     reply(Caller, Reply),
     {noreply, NewState};
-response(Caller, {stop, Reason, NewState}) ->
+response(Command, Caller, {proxy, Target, NewState}) ->
+    proxy(Caller, Target, Command, NewState);
+response(_, Caller, {stop, Reason, NewState}) ->
     reply(Caller, stopping),
     {stop, Reason, NewState};
-response(Caller, {stop, Reason, Reply, NewState}) ->
+response(_, Caller, {stop, Reason, Reply, NewState}) ->
     reply(Caller, Reply),
     {stop, Reason, NewState}.
+
+proxy(Caller, Path, Command, State) when is_list(Path) ->
+    handle_info({'$$', Caller, Path, Command}, State);
+proxy(Caller, {Process, Path}, Command, State) ->
+    catch Process ! {'$$', Caller, Path, Command},
+    {noreply, State};
+proxy(Caller, Process, Command, State) ->
+    catch Process ! {'$$', Caller, [], Command},
+    {noreply, State}.
+
+proxy_call(Path, Command, State) when is_list(Path) ->
+    invoke(Command, Path, State);
+proxy_call(Target, Command, State) ->
+    state_call(Target, Command, State).
+
+state_call(Target, Command, State) ->
+    Timeout = maps:get(timeout, State, ?DFL_TIMEOUT),
+    Result = call(Target, Command, Timeout),
+    {Result, State}.
+
 
 %% Invoke on root of actor.
 request(stop, [], _, State) ->
@@ -891,20 +910,15 @@ request(Command, To, From, State) ->
         {action, Func, Route} ->
             perform(Func, Command, Route, From, State);
         {actor, Pid, Sprig} ->
-            catch Pid ! {'$$', From, Sprig, Command},
-            {noreply, State}
+            {proxy, {Pid, Sprig}, State}
     end.
 
-access(touch, [], _) ->
-    {result, ok};
 access(get, [], Data) ->
     {result, Data};
 access({put, Value}, [], _) ->
     {update, ok, Value};
 access(delete, [], _) ->
     {delete, ok};
-access({touch, Selection}, [], Data) ->
-    access({get, Selection}, [], Data);
 access({get, Selection}, [], Data)
   when is_list(Selection) andalso is_map(Data) ->
     Value = maps:with(Selection, Data),
@@ -987,8 +1001,6 @@ do_state(Info, State) ->
     try handle_info(Info, State) of
         {noreply, S} ->
             {noreply, swap(S)};
-        {unhandled, S} ->
-            {unhandled, swap(S)};
         {stop, normal, S} ->
             S1 = on_exit(S),
             Sign = maps:get(sign, S1, stop),
