@@ -138,8 +138,8 @@
 
 %%-- Messages.
 -type message() :: {'$$', command()} |
-                   {'$$', path(), command()} |
-                   {'$$', from(), path(), command()}.
+                   {'$$', target(), command()} |
+                   {'$$', from(), target(), command()}.
 -type path() :: list().
 -type from() :: {pid(), reference()} | 'call' | 'cast'.
 -type command() :: method() |
@@ -154,7 +154,7 @@
                   'stop' |
                   tag().
 -type process() :: pid() | atom().
--type target() :: process() | path() | {process(), path()}.
+-type target() :: process() | path() | {process(), path()} | tag().
 
 %%-- actors
 -type actor_type() :: 'stem' | 'actor' | 'fsm' | 'thing'.
@@ -431,64 +431,64 @@ cast(Process, Path, Message) ->
 
 %%-- Data access.
 %%------------------------------------------------------------------------------
--spec get(path()) -> reply().
+-spec get(target()) -> reply().
 get(Path) ->
     call(Path, get).
 
--spec get(path(), Options :: any()) -> reply().
+-spec get(target(), Options :: any()) -> reply().
 get(Path, Options) ->
     call(Path, {get, Options}).
 
--spec put(path(), Value :: any()) -> reply().
+-spec put(target(), Value :: any()) -> reply().
 put(Path, Value) ->
     call(Path, {put, Value}).
 
--spec put(path(), Value :: any(), Options :: any()) -> reply().
+-spec put(target(), Value :: any(), Options :: any()) -> reply().
 put(Path, Value, Options) ->
     call(Path, {put, Value, Options}).
 
--spec patch(path(), Value :: any()) -> reply().
+-spec patch(target(), Value :: any()) -> reply().
 patch(Path, Value) ->
     call(Path, {patch, Value}).
 
--spec patch(path(), Value :: any(), Options :: any()) -> reply().
+-spec patch(target(), Value :: any(), Options :: any()) -> reply().
 patch(Path, Value, Options) ->
     call(Path, {patch, Value, Options}).
 
--spec new(path(), Value :: any()) -> reply().
+-spec new(target(), Value :: any()) -> reply().
 new(Path, Value) ->
     call(Path, {new, Value}).
 
--spec new(path(), Value :: any(), Options :: any()) -> reply().
+-spec new(target(), Value :: any(), Options :: any()) -> reply().
 new(Path, Value, Options) ->
     call(Path, {new, Value, Options}).
 
--spec delete(path()) -> reply().
+-spec delete(target()) -> reply().
 delete(Path) ->
     call(Path, delete).
 
--spec delete(path(), Options :: any()) -> reply().
+-spec delete(target(), Options :: any()) -> reply().
 delete(Path, Options) ->
     call(Path, {delete, Options}).
 
 %%-- Operations.
 %%------------------------------------------------------------------------------
--spec subscribe(path()) -> reply().
+-spec subscribe(target()) -> reply().
 subscribe(Path) ->
     Target = chain(Path, subscribers),
     call(Target, {new, self()}).
 
--spec subscribe(path(), pid()) -> reply().
+-spec subscribe(target(), pid()) -> reply().
 subscribe(Path, Pid) ->
     Target = chain(Path, subscribers),
     call(Target, {new, Pid}).
 
--spec unsubscribe(path(), reference()) -> reply().
+-spec unsubscribe(target(), reference()) -> reply().
 unsubscribe(Path, Ref) ->
     Target = chain(Path, [subscribers, Ref]),
     call(Target, delete).
 
--spec notify(path(), Info :: any()) -> reply().
+-spec notify(target(), Info :: any()) -> reply().
 notify(Path, Info) ->
     Target = chain(Path, subscribers),
     call(Target, {notify, Info}).
@@ -547,7 +547,10 @@ chain_actions(State1, State2, Actions) ->
            end,
     lists:foldl(Func, State1, Actions).
 
--spec chain(Head :: any(), Tail :: any()) -> list().
+-spec chain(Head :: target(), Tail :: any()) -> list().
+chain({Process, Path}, Tail) ->
+    NewPath = chain(Path, Tail),
+    {Process, NewPath};
 chain(Head, Tail) when is_list(Head) andalso is_list(Tail) ->
     Head ++ Tail;
 chain(Head, Tail) when is_list(Head) ->
@@ -581,7 +584,7 @@ handle(_, State) ->
     {noreply, State}.
 
 %%- Internal state operation.
--spec invoke(Command :: any(), path(), state()) -> result().
+-spec invoke(Command :: any(), target(), state()) -> result().
 invoke(Command, Path, State) ->
     case access(Command, Path, State) of
         {result, Res} ->
@@ -665,16 +668,12 @@ swap(#{'$fsm' := F} = State) ->
 %%  * 'subscribers': active attribute for subscription actions.
 %%  * '_subscribers': subscribers data cache.
 %%  * 'report_items': definition of output items when actor exit.
--spec subscribers(Command :: any(), path(), state()) -> result().
+-spec subscribers(Command :: any(), target(), state()) -> result().
 subscribers({new, Pid}, [], State) ->
     Subs = maps:get('_subscribers', State, #{}),
     Mref = monitor(process, Pid),
     Subs1 = Subs#{Mref => Pid},
     {Mref, State#{'_subscribers' => Subs1}};
-subscribers(delete, [Mref], #{'_subscribers' := Subs} = State) ->
-    demonitor(Mref),
-    Subs1 = maps:remove(Mref, Subs),
-    {ok, State#{'_subscribers' := Subs1}};
 subscribers({notify, Info}, [], #{'_subscribers' := Subs} = State) ->
     maps:fold(fun(M, P, _) -> catch P ! {M, Info} end, 0, Subs),
     {ok, State};
@@ -684,12 +683,18 @@ subscribers({notify, Info, remove}, [], #{'_subscribers' := Subs} = State) ->
                       demonitor(Mref)
               end, 0, Subs),
     {ok, maps:remove('_subscribers', State)};
+subscribers(delete, [Mref], #{'_subscribers' := Subs} = State) ->
+    demonitor(Mref),
+    Subs1 = maps:remove(Mref, Subs),
+    {ok, State#{'_subscribers' := Subs1}};
+subscribers(delete, Mref, State) ->
+    subscribers(delete, [Mref], State);
 subscribers(_, _, State) ->
     {{error, badarg}, State}.
 
 %%-- Links
--spec links(Command :: any(), path(), state()) -> result().
-links(get, Key, State) ->
+-spec links(Command :: any(), target(), state()) -> result().
+links(get, [Key], State) ->
     case attach(Key, State) of
         {ok, S} ->
             {maps:get(Key, S), S};
@@ -712,8 +717,10 @@ links({new, Target}, Key, State) ->
         Stop ->
             Stop
     end;
-links(delete, Key, State) ->
+links(delete, [Key], State) ->
     detach(Key, State);
+links(Command, Key, State) when not is_list(Key) ->
+    links(Command, [Key], State);
 links(_, _, State) ->
     {{error, badarg}, State}.
 
@@ -758,6 +765,8 @@ monitors({new, Pid, #{key := Key}}, [], State) ->
     monitors({new, Pid}, [Key], State);
 monitors({delete, Key}, [], State) ->
     monitors(delete, [Key], State);
+monitors(Command, Key, State) when not is_list(Key) ->
+    monitors(Command, [Key], State);
 monitors(_, _, State) ->
     {{error, badarg}, State}.
 

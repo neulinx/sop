@@ -1,6 +1,11 @@
 CHANGELOG
 =========
 
+2.2.2 Support message path which is not list type
+------------------------------------------------
+
+- `{'$$', Caller, Target, Command}`, which Target can be any type.
+
 2.2.1 Change request format of action new
 -----------------------------------------
 
