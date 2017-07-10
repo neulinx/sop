@@ -1,6 +1,12 @@
 CHANGELOG
 =========
 
+2.2.1 Change request format of action new
+-----------------------------------------
+
+- API new/3: from new(Path, Key Value) to new(Path, Value, Options).
+- Action new: from {new, Key, Value} to {new, Value, #{key := Key}}.
+
 2.2.0 New feature: proxy
 ------------------------
 

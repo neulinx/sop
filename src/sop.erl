@@ -142,7 +142,10 @@
                    {'$$', from(), path(), command()}.
 -type path() :: list().
 -type from() :: {pid(), reference()} | 'call' | 'cast'.
--type command() :: method() | {method(), any()} | {'new', any(), any()} | any().
+-type command() :: method() |
+                   {method(), any()} |
+                   {method(), any(), any()} |
+                   any().
 -type method() :: 'get' |
                   'put' |
                   'patch' |
@@ -456,9 +459,9 @@ patch(Path, Value, Options) ->
 new(Path, Value) ->
     call(Path, {new, Value}).
 
--spec new(path(), tag(), Value :: any()) -> reply().
-new(Path, Key, Value) ->
-    call(Path, {new, Key, Value}).
+-spec new(path(), Value :: any(), Options :: any()) -> reply().
+new(Path, Value, Options) ->
+    call(Path, {new, Value, Options}).
 
 -spec delete(path()) -> reply().
 delete(Path) ->
@@ -615,7 +618,7 @@ attach(Key, State) ->
 -spec attach(tag(), Value :: any(), state()) -> result().
 attach(Key, Pid, State) when is_pid(Pid) ->
     %% Ignore result of monitors.
-    case invoke({new, Key, Pid}, [monitors], State) of
+    case invoke({new, Pid}, [monitors, Key], State) of
         {_, S} ->
             {ok, S#{Key => Pid}};
         Stop ->
@@ -625,7 +628,7 @@ attach(Key, {state, S}, State) ->
     S1 = S#{surname => Key, parent => self()},
     case start_link(S1) of
         {ok, Pid} ->
-            case invoke({new, Key, Pid}, [monitors], State) of
+            case invoke({new, Pid}, [monitors, Key], State) of
                 {_, State1} ->
                     {ok, State1#{Key => Pid}};
                 Stop ->
@@ -715,14 +718,14 @@ links(_, _, State) ->
     {{error, badarg}, State}.
 
 -spec monitors(Command :: any(), path(), state()) -> result().
-monitors({get, Key}, [], #{'_monitors' := M} = State) ->
+monitors(get, [Key], #{'_monitors' := M} = State) ->
     case maps:find(Key, M) of
         error ->
             {{error, undefined}, State};
         {ok, Value} ->
             {Value, State}
     end;
-monitors({new, Key, Pid}, [], State) ->
+monitors({new, Pid}, [Key], State) ->
     M = maps:get('_monitors', State, #{}),
     Mref = monitor(process, Pid),
     M1 = M#{Mref => Key, Key => Mref},
@@ -734,7 +737,7 @@ monitors({delete, all}, [], #{'_monitors' := M} = State) ->
                       noop
               end, 0, M),
     {ok, maps:remove('_monitors', State)};
-monitors({delete, Key}, [], #{'_monitors' := M} = State) ->
+monitors(delete, [Key], #{'_monitors' := M} = State) ->
     case maps:find(Key, M) of
         {ok, Ref} when is_reference(Ref) ->
             demonitor(Ref),
@@ -749,12 +752,12 @@ monitors({delete, Key}, [], #{'_monitors' := M} = State) ->
         error ->
             {{error, undefined}, State}
     end;
-monitors(get, [Key], State) ->
-    monitors({get, Key}, [], State);
-monitors({new, Pid}, [Key], State) ->
-    monitors({new, Key, Pid}, [], State);
-monitors(delete, [Key], State) ->
-    monitors({delete, Key}, [], State);
+monitors({get, Key}, [], State) ->
+    monitors(get, [Key], State);
+monitors({new, Pid, #{key := Key}}, [], State) ->
+    monitors({new, Pid}, [Key], State);
+monitors({delete, Key}, [], State) ->
+    monitors(delete, [Key], State);
 monitors(_, _, State) ->
     {{error, badarg}, State}.
 
@@ -927,7 +930,7 @@ access({patch, Value}, [], Data)
   when is_map(Value) andalso is_map(Data) ->
     NewData = maps:merge(Data, Value),
     {update, ok, NewData};
-access({new, Key, Value}, [], Data) when is_map(Data) ->
+access({new, Value, #{key := Key}}, [], Data) when is_map(Data) ->
     {update, Key, Data#{Key => Value}};
 access({new, Value}, [], Data) when is_map(Data) ->
     {Key, NewData} = new_attribute(Value, Data),
