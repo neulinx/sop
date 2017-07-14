@@ -8,6 +8,8 @@
 %%%-------------------------------------------------------------------
 -module(sop).
 
+-compile({no_auto_import, [get/1, put/2]}).
+
 %% Support inline unit test for EUnit.
 -ifdef(TEST).
     -include_lib("eunit/include/eunit.hrl").
@@ -40,7 +42,8 @@
 %% Generic.
 -export([reply/2,
          call/2, call/3, call/4,
-         cast/2, cast/3
+         cast/2, cast/3,
+         act/3
         ]).
 
 %% Operations.
@@ -66,7 +69,7 @@
         ]).
 
 %%-- Internal operations.
-%% Path or sequence.
+%% Attributes.
 -export([chain/2,
          chain_action/3,
          chain_actions/3,
@@ -76,18 +79,23 @@
         ]).
 %% Internal process.
 -export([handle/2,
+         state_call/3,
+         relay/4,
          invoke/3,
          attach/2, attach/3,
-         detach/2
+         detach/2,
+         access/3,
+         perform/5
         ]).
 
 %%-- Actions
 -export([links/3,
          monitors/3,
-         subscribers/3
+         subscribers/3,
+         links_do/2,
+         monitors_do/2,
+         subscribers_do/2
         ]).
-
-
 %%- Types.
 %%------------------------------------------------------------------------------
 -export_type([state/0,
@@ -110,6 +118,7 @@
 -type state() :: #{'entry' => entry_fun() | [entry_fun()],
                    'exit' => exit_fun() | [exit_fun()],
                    'do' => do_fun() | [do_fun()],
+                   '_do' => do_fun(),
                    'pid' => pid(),
                    'entry_time' => timestamp(),
                    'exit_time' => timestamp(),
@@ -131,15 +140,16 @@
 -type pass() :: 'ok' | 'noreply' | 'unhandled' | any().
 -type fail() :: {'error', Error :: any()}.
 -type reply() :: pass() | fail().
+-type relay() :: {'relay', target(), state()}.
 -type stop() :: {'stop', Reason :: any(), state()} |
                 {'stop', Reason :: any(), reply(), state()}.
--type proxy() :: {'proxy', target(), state()}.
--type result() :: {reply(), state()} | proxy() | stop().
+-type result() :: {reply(), state()} | relay() | stop().
 
 %%-- Messages.
 -type message() :: {'$$', command()} |
                    {'$$', target(), command()} |
-                   {'$$', from(), target(), command()}.
+                   {'$$', from(), target(), command()} |
+                   any().
 -type path() :: list().
 -type from() :: {pid(), reference()} | 'call' | 'cast'.
 -type command() :: method() |
@@ -222,25 +232,20 @@ create(stem, Data) ->
 %% fsm: stem, $start, $state, $fsm, states, step, max_steps, sign, payload.
 create(fsm, Data) ->
     chain_action(Data, do, fun fsm_do/2);
-%% actor: stem, subscribers, _subscribers, links, _links, monitors, _monitors,
+%% actor: stem, subscribers, _subscribers, links, monitors, _monitors,
 %% report_items, surname, parent.
 create(actor, Data) ->
     Actor = #{subscribers => fun subscribers/3,
-              links => fun links/3,
               monitors => fun monitors/3,
-              do => fun actor_do/2,
+              links => fun links/3,
+              do => [fun links_do/2, fun monitors_do/2, fun subscribers_do/2],
               exit => fun actor_exit/1
              },
     merge(Actor, Data);
 %% thing: stem, fsm, actor.
 create(thing, Data) ->
-    Thing = #{subscribers => fun subscribers/3,
-              links => fun links/3,
-              monitors => fun monitors/3,
-              do => [fun fsm_do/2, fun actor_do/2],
-              exit => fun actor_exit/1
-             },
-    merge(Thing, Data);
+    Actor = create(actor, Data),
+    chain_action(Actor, do, fun fsm_do/2);
 create(Module, Data) ->
     from_module(Module, Data).
 
@@ -346,8 +351,8 @@ handle_info(Info, State) ->
     case chain_react(do, Info, State) of
         {unhandled, S} ->
             handle(Info, S);
-        {proxy, Proxy, S} ->
-            catch Proxy ! Info,
+        {relay, NextHop, S} ->
+            catch NextHop ! Info,
             {noreply, S};
         Result ->
             Result
@@ -383,7 +388,7 @@ reply({To, Tag}, Reply) ->
 reply(_, _) ->
     ok.
 
--spec call(target(), Request :: any()) -> reply().
+-spec call(target(), command()) -> reply().
 call([Process | Path], Command) ->
     call(Process, Path, Command, ?DFL_TIMEOUT);
 call({Process, Path}, Command) ->
@@ -391,7 +396,7 @@ call({Process, Path}, Command) ->
 call(Process, Command) ->
     call(Process, [], Command, ?DFL_TIMEOUT).
 
--spec call(target(), Request :: any(), timeout()) -> reply().
+-spec call(target(), command(), timeout()) -> reply().
 call([Process | Path], Command, Timeout) ->
     call(Process, Path, Command, Timeout);
 call({Process, Path}, Command, Timeout) ->
@@ -399,7 +404,7 @@ call({Process, Path}, Command, Timeout) ->
 call(Process, Command, Timeout) ->
     call(Process, [], Command, Timeout).
 
--spec call(process(), path(), Request :: any(), timeout()) -> reply().
+-spec call(process(), path(), command(), timeout()) -> reply().
 call(Process, Path, Command, Timeout) ->
     Mref = monitor(process, Process),
     Tag = make_ref(),
@@ -416,7 +421,7 @@ call(Process, Path, Command, Timeout) ->
             {error, timeout}
     end.
 
--spec cast(target(), Message :: any()) -> 'ok'.
+-spec cast(target(), command()) -> 'ok'.
 cast([Process | Path], Command) ->
     cast(Process, Path, Command);
 cast({Process, Path}, Command) ->
@@ -428,6 +433,11 @@ cast(Process, Command) ->
 cast(Process, Path, Message) ->
     catch Process ! {'$$', cast, Path, Message},
     ok.
+
+-spec act(tag(), target(), Args :: any()) -> reply().
+act(Action, Target, Args) ->
+    Path = chain(Target, Action),
+    call(Path, Args).
 
 %%-- Data access.
 %%------------------------------------------------------------------------------
@@ -572,7 +582,7 @@ chain_react(Attribute, Event, State) ->
     end.
 
 %%-- sop messages.
--spec handle(Command :: any(), state()) -> result().
+-spec handle(command(), state()) -> result().
 handle({'$$', From, To, Command}, State) ->
     response(Command, From, request(Command, To, From, State));
 handle({'$$', From, Command}, State) ->
@@ -583,8 +593,19 @@ handle({'$$', Command}, State) ->
 handle(_, State) ->
     {noreply, State}.
 
+
+-spec relay(from(), To :: target(), command(), state()) -> result().
+relay(Caller, Path, Command, State) when is_list(Path) ->
+    handle_info({'$$', Caller, Path, Command}, State);
+relay(Caller, {Process, Path}, Command, State) ->
+    catch Process ! {'$$', Caller, Path, Command},
+    {noreply, State};
+relay(Caller, Process, Command, State) ->
+    catch Process ! {'$$', Caller, [], Command},
+    {noreply, State}.
+
 %%- Internal state operation.
--spec invoke(Command :: any(), target(), state()) -> result().
+-spec invoke(command(), target(), state()) -> result().
 invoke(Command, Path, State) ->
     case access(Command, Path, State) of
         {result, Res} ->
@@ -592,10 +613,12 @@ invoke(Command, Path, State) ->
         {update, Reply, NewState} ->
             {Reply, NewState};
         {action, Func, Route} ->
-            %% Caller is call means neither aynchronous return nor proxy.
+            %% Caller is call means neither aynchronous return nor forwarding.
             case perform(Func, Command, Route, call, State) of
-                {proxy, Proxy, S} ->
-                    proxy_call(Proxy, Command, S);
+                {relay, Next, S} when is_list(Next) ->
+                    invoke(Command, Next, S);
+                {relay, Next, S} ->
+                    state_call(Next, Command, S);
                 Result ->
                     Result
             end;
@@ -605,11 +628,16 @@ invoke(Command, Path, State) ->
             {{error, badarg}, State}
     end.
 
+-spec state_call(target(), command(), state()) -> {Result :: any(), state()}.
+state_call(Target, Command, State) ->
+    Timeout = maps:get(timeout, State, ?DFL_TIMEOUT),
+    Result = call(Target, Command, Timeout),
+    {Result, State}.
+
 -spec attach(tag(), state()) -> result().
 attach(Key, State) ->
-    {_, S} = detach(Key, State),
-    Path = chain('_links', Key),
-    case invoke(get, Path, S) of
+    Path = chain(links, Key),
+    case invoke(get, Path, State) of
         {{error, _}, _} = Error ->
             Error;
         {Value, S1} ->
@@ -627,6 +655,8 @@ attach(Key, Pid, State) when is_pid(Pid) ->
         Stop ->
             Stop
     end;
+attach(Key, Func, State) when is_function(Func) ->
+    {ok, State#{Key => Func}};
 attach(Key, {state, S}, State) ->
     S1 = S#{surname => Key, parent => self()},
     case start_link(S1) of
@@ -643,8 +673,8 @@ attach(Key, {state, S}, State) ->
 %% To accept pid or state data.
 attach(Key, {data, Value}, State) ->
     {ok, State#{Key => Value}};
-attach(Key, Value, State) ->
-    {ok, State#{Key => Value}}.
+attach(_, _, State) ->
+    {{error, badarg}, State}.
 
 -spec detach(tag(), state()) -> result().
 detach(Key, State) ->
@@ -661,6 +691,64 @@ swap(#{'$state' := S} = Fsm) ->
 swap(#{'$fsm' := F} = State) ->
     F#{'$state' => maps:remove('$fsm', State)}.
 
+-spec access(command(), target(), Package :: any()) -> 
+                    {'result', any()} |
+                    {'update', tag(), any()} |
+                    {'delete', 'ok'} |
+                    {'action', function()} |
+                    {'actor', pid()}.
+access(get, [], Data) ->
+    {result, Data};
+access({put, Value}, [], _) ->
+    {update, ok, Value};
+access(delete, [], _) ->
+    {delete, ok};
+access({get, Selection}, [], Data)
+  when is_list(Selection) andalso is_map(Data) ->
+    Value = maps:with(Selection, Data),
+    {result, Value};
+access({patch, Value}, [], Data)
+  when is_map(Value) andalso is_map(Data) ->
+    NewData = maps:merge(Data, Value),
+    {update, ok, NewData};
+access({new, Value, #{key := Key}}, [], Data) when is_map(Data) ->
+    {update, Key, Data#{Key => Value}};
+access({new, Value}, [], Data) when is_map(Data) ->
+    {Key, NewData} = new_attribute(Value, Data),
+    {update, Key, NewData};
+access(Command, [Key | Rest], Data) when is_map(Data) ->
+    case maps:find(Key, Data) of
+        {ok, Value} ->
+            case access(Command, Rest, Value) of
+                {update, Reply, NewValue} ->
+                    {update, Reply, Data#{Key => NewValue}};
+                {delete, ok} ->
+                    {update, ok, maps:remove(Key, Data)};
+                Result ->
+                    Result
+            end;
+        error ->
+            {result, {error, undefined}}
+    end;
+access(_, Sprig, Data) when is_function(Data) ->
+    {action, Data, Sprig};
+access(_, Sprig, Data) when is_pid(Data) ->
+    {actor, Data, Sprig};
+access(_, [], _) ->
+    {result, {error, badarg}};
+access(Command, Key, State) ->
+    access(Command, [Key], State).
+
+-spec perform(function(), command(), target(), from(), state()) -> result().
+perform(Func, Command, Sprig, From, State) when is_function(Func, 4) ->
+    Func(Command, Sprig, From, State);
+perform(Func, Command, Sprig, _, State) when is_function(Func, 3) ->
+    Func(Command, Sprig, State);
+perform(Func, Command, _, _, State) when is_function(Func, 2) ->
+    Func(Command, State);
+perform(Func, _, _, _, State) ->
+    Func(State).
+
 %%- Active attributes.
 %%------------------------------------------------------------------------------
 %%-- Subscription & notification.
@@ -668,7 +756,7 @@ swap(#{'$fsm' := F} = State) ->
 %%  * 'subscribers': active attribute for subscription actions.
 %%  * '_subscribers': subscribers data cache.
 %%  * 'report_items': definition of output items when actor exit.
--spec subscribers(Command :: any(), target(), state()) -> result().
+-spec subscribers(command(), target(), state()) -> result().
 subscribers({new, Pid}, [], State) ->
     Subs = maps:get('_subscribers', State, #{}),
     Mref = monitor(process, Pid),
@@ -692,39 +780,7 @@ subscribers(delete, Mref, State) ->
 subscribers(_, _, State) ->
     {{error, badarg}, State}.
 
-%%-- Links
--spec links(Command :: any(), target(), state()) -> result().
-links(get, [Key], State) ->
-    case attach(Key, State) of
-        {ok, S} ->
-            {maps:get(Key, S), S};
-        Exception ->
-            Exception
-    end;
-%%!notice: anonymous link when Key is [].
-links({new, Target}, Key, State) ->
-    Path = chain('_links', Key),
-    case invoke({new, Target}, Path, State) of
-        {{error, _}, _} = Error ->
-            Error;
-        {NewKey, S} ->
-            case attach(NewKey, S) of
-                {ok, S1} ->
-                    {NewKey, S1};
-                Exception ->
-                    Exception
-            end;
-        Stop ->
-            Stop
-    end;
-links(delete, [Key], State) ->
-    detach(Key, State);
-links(Command, Key, State) when not is_list(Key) ->
-    links(Command, [Key], State);
-links(_, _, State) ->
-    {{error, badarg}, State}.
-
--spec monitors(Command :: any(), path(), state()) -> result().
+-spec monitors(command(), path(), state()) -> result().
 monitors(get, [Key], #{'_monitors' := M} = State) ->
     case maps:find(Key, M) of
         error ->
@@ -770,30 +826,70 @@ monitors(Command, Key, State) when not is_list(Key) ->
 monitors(_, _, State) ->
     {{error, badarg}, State}.
 
-actor_do({'$$', From, [Key | _], _} = Req, State) ->
-    case maps:find(Key, State) of
-        error ->
-            case invoke(get, [states, Key], State) of
-                {{error, _} = Error, S} ->
-                    reply(From, Error),
-                    {noreply, S};
-                {_, S} ->
-                    handle(Req, S);
+-spec links(command(), target(), state()) -> result().
+links(_, [Key | _] = Path, State) ->
+    case invoke(attach, ['_links', Key], State) of
+        {ok, S} ->
+            {relay, Path, S};
+        Exception ->
+            Exception
+    end;
+links(_, _, State) ->
+    {{error, badarg}, State}.
+
+-spec links_do(message(), state()) -> result().
+links_do({'$$', _, [links | _], _}, State) ->
+    {unhandled, State};
+links_do({'$$', _, _, delete}, State) ->
+    {unhandled, State};
+links_do({'$$', From, [Key | _] = Path, Command}, #{links := L} = State) ->
+    %%!todo: optimize repeat fetching of Key.
+    case maps:is_key(Key, State) of
+        true ->
+            {unhandled, State};
+        false when is_map(L) ->
+            case maps:find(Key, L) of
+                error ->
+                    reply(From, {error, undefined}),
+                    {noreply, State};
+                {ok, Value} ->
+                    case attach(Key, Value, State) of
+                        {ok, S} ->
+                            {unhandled, S};
+                        {Error, S} ->
+                            reply(From, Error),
+                            {noreply, S};
+                        Stop ->
+                            Stop
+                    end
+            end;
+        false ->
+            relay(From, [links | Path], Command, State)
+    end;
+links_do(_, State) ->
+    {unhandled, State}.
+
+-spec monitors_do(message(), state()) -> result().
+monitors_do({'$$', From, [Key], delete}, State) ->
+    case maps:take(Key, State) of
+        {Pid, S} when is_pid(Pid) ->
+            cast(Pid, {'$$detach', Key, self()}),
+            case invoke({delete, Key}, [monitors], S) of
+                {_, S1} ->
+                    reply(From, ok),
+                    {noreply, S1};
                 Stop ->
                     Stop
             end;
-        _ ->
-            handle(Req, State)
+        {_, S} ->
+            reply(From, ok),
+            {noreply, S};
+        error ->
+            reply(From, {error, undefined}),
+            {noreply, State}
     end;
-actor_do({'DOWN', M, _, _, _}, State) ->
-    S = case maps:find('_subscribers', State) of
-            {ok, Subs} ->
-                Subs1 = maps:remove(M, Subs),
-                State#{'_subscribers' := Subs1};
-            error ->
-                State
-        end,
-    case invoke({delete, M}, [monitors], S) of
+monitors_do({'DOWN', M, _, _, _}, State) ->
+    case invoke({delete, M}, [monitors], State) of
         {_, State} ->  % no change
             {unhandled, State};
         {{error, _}, S1} ->
@@ -804,8 +900,31 @@ actor_do({'DOWN', M, _, _, _}, State) ->
         Stop ->
             Stop
     end;
-actor_do(_, State) ->
+monitors_do(_, State) ->
     {unhandled, State}.
+
+-spec subscribers_do(message(), state()) -> result().
+subscribers_do({'DOWN', M, _, _, _}, State) ->
+    case maps:find('_subscribers', State) of
+        {ok, Subs} ->
+            Subs1 = maps:remove(M, Subs),
+            {noreply, State#{'_subscribers' := Subs1}};
+        error ->
+            {unhandled, State}
+    end;
+subscribers_do(_, State) ->
+    {unhandled, State}.
+
+
+%% actor_do({Tag, Result}, State) ->
+%%     case invoke(get, [pending, Tag], State) of
+%%         {{relay, Caller}, S} ->
+%%             relay(Caller, Result);
+%%         {{Func, Caller, once}, S} ->
+%%             Func(Result, Caller, S);
+%%         Exception ->
+%%             Exception
+%%     end;
 
 %% Goodbye, subscribers! And submit leave report.
 actor_exit(State) ->
@@ -868,8 +987,8 @@ response(_, _, {noreply, NewState}) ->
 response(_, Caller, {Reply, NewState}) ->
     reply(Caller, Reply),
     {noreply, NewState};
-response(Command, Caller, {proxy, Target, NewState}) ->
-    proxy(Caller, Target, Command, NewState);
+response(Command, Caller, {relay, Target, NewState}) ->
+    relay(Caller, Target, Command, NewState);
 response(_, Caller, {stop, Reason, NewState}) ->
     reply(Caller, stopping),
     {stop, Reason, NewState};
@@ -877,41 +996,9 @@ response(_, Caller, {stop, Reason, Reply, NewState}) ->
     reply(Caller, Reply),
     {stop, Reason, NewState}.
 
-proxy(Caller, Path, Command, State) when is_list(Path) ->
-    handle_info({'$$', Caller, Path, Command}, State);
-proxy(Caller, {Process, Path}, Command, State) ->
-    catch Process ! {'$$', Caller, Path, Command},
-    {noreply, State};
-proxy(Caller, Process, Command, State) ->
-    catch Process ! {'$$', Caller, [], Command},
-    {noreply, State}.
-
-proxy_call(Path, Command, State) when is_list(Path) ->
-    invoke(Command, Path, State);
-proxy_call(Target, Command, State) ->
-    state_call(Target, Command, State).
-
-state_call(Target, Command, State) ->
-    Timeout = maps:get(timeout, State, ?DFL_TIMEOUT),
-    Result = call(Target, Command, Timeout),
-    {Result, State}.
-
-
 %% Invoke on root of actor.
-request(stop, [], _, State) ->
-    {stop, normal, State};
-request({stop, Reason}, [], _, State) ->
-    {stop, Reason, State};
 request(Command, [], _, State) ->
-    case access(Command, [], State) of
-        {result, Res} ->
-            {Res, State};
-        {update, Reply, NewS} when (not is_tuple(Command));
-                                   element(1, Command) =/= put ->
-            {Reply, NewS};
-        _ ->
-            {{error, badarg}, State}
-    end;
+    root_do(Command, State);
 %% Branches and sprig.
 request(Command, To, From, State) ->
     case access(Command, To, State) of
@@ -922,57 +1009,33 @@ request(Command, To, From, State) ->
         {action, Func, Route} ->
             perform(Func, Command, Route, From, State);
         {actor, Pid, Sprig} ->
-            {proxy, {Pid, Sprig}, State}
+            {relay, {Pid, Sprig}, State}
     end.
 
-access(get, [], Data) ->
-    {result, Data};
-access({put, Value}, [], _) ->
-    {update, ok, Value};
-access(delete, [], _) ->
-    {delete, ok};
-access({get, Selection}, [], Data)
-  when is_list(Selection) andalso is_map(Data) ->
-    Value = maps:with(Selection, Data),
-    {result, Value};
-access({patch, Value}, [], Data)
-  when is_map(Value) andalso is_map(Data) ->
-    NewData = maps:merge(Data, Value),
-    {update, ok, NewData};
-access({new, Value, #{key := Key}}, [], Data) when is_map(Data) ->
-    {update, Key, Data#{Key => Value}};
-access({new, Value}, [], Data) when is_map(Data) ->
-    {Key, NewData} = new_attribute(Value, Data),
-    {update, Key, NewData};
-access(Command, [Key | Rest], Data) when is_map(Data) ->
-    case maps:find(Key, Data) of
-        {ok, Value} ->
-            case access(Command, Rest, Value) of
-                {update, Reply, NewValue} ->
-                    {update, Reply, Data#{Key => NewValue}};
-                {delete, Reply} ->
-                    {update, Reply, maps:remove(Key, Data)};
-                Result ->
-                    Result
-            end;
-        error ->
-            {result, {error, undefined}}
+root_do(Command, #{'_do' := R} = State) when is_function(R, 2) ->
+    case R(Command, State) of
+        {unhandled, S} ->
+            do_(Command, S);
+        Result ->
+            Result
     end;
-access(_, Sprig, Data) when is_function(Data) ->
-    {action, Data, Sprig};
-access(_, Sprig, Data) when is_pid(Data) ->
-    {actor, Data, Sprig};
-access(_, [], _) ->
-    {result, {error, badarg}};
-access(Command, Key, State) ->
-    access(Command, [Key], State).
+root_do(Command, State) ->
+    do_(Command, State).
 
-perform(Func, Command, _, _, State) when is_function(Func, 2) ->
-    Func(Command, State);
-perform(Func, Command, Sprig, _, State) when is_function(Func, 3) ->
-    Func(Command, Sprig, State);
-perform(Func, Command, Sprig, From, State) ->
-    Func(Command, Sprig, From, State).
+do_(stop, State) ->
+    {stop, normal, State};
+do_({stop, Reason},  State) ->
+    {stop, Reason, State};
+do_(Command, State) ->
+    case access(Command, [], State) of
+        {result, Res} ->
+            {Res, State};
+        {update, Reply, NewS} when (not is_tuple(Command));
+                                   element(1, Command) =/= put ->
+            {Reply, NewS};
+        _ ->
+            {{error, badarg}, State}
+    end.
 
 %% Selective report.
 make_report(all, State) ->

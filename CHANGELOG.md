@@ -1,6 +1,23 @@
 CHANGELOG
 =========
 
+2.3.0 Many features added and passed first unit test
+----------------------------------------------------
+
+- Fix bug of links cache access.
+- Do not auto import erlang:get/1 and erlang:put/2.
+- Merge `state` and `_state` attribute and remove state function.
+  - And make attach/2 more specified for active attribute.
+- Change name of proxy to relay, which is to distingush from `asyn_call`.
+- Export `relay/4` and `state_call/4`.
+- Change function specs parameters `Command :: any()` to `command()`.
+- Split `actor_do` into `links_do`, `monitors_do` and `subscribers_do`.
+- Re-export `links`, `monitors`, `subscribers`, `links_do`, `monitors_do`,
+  `subscibers_do`.
+- Add helper function act/3, for differenct wrap for request.
+- Make root action more custmoized, '_do' function for global command.
+- Export access/3, perform/5.
+
 2.2.2 Support message path which is not list type
 ------------------------------------------------
 
