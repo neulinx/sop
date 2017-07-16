@@ -1,6 +1,20 @@
 CHANGELOG
 =========
 
+2.4.0 Internal call support asynchronous mode
+---------------------------------------------
+
+- Add fun act/2 helper.
+- Make chain_action more gerenic, and support chain position.
+- Asynchronous call support:
+  - `chain_callback`, `enqueue_callback`, `asyn_call`
+  - `handle_result` add to handle procedure to check and invoke callback queue.
+  - Check `DOWN` message to cleanup pending_queue of callbacks.
+- Remoe fun links/3 function.
+- Change coding style.
+  - Two blank lines between code segments.
+  - Group functions by relevance rather than internal/external.
+
 2.3.0 Many features added and passed first unit test
 ----------------------------------------------------
 
