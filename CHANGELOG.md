@@ -1,6 +1,11 @@
 CHANGELOG
 =========
 
+v2.5.1, merge bonds to monitors.
+--------------------------------
+
+And re-arrange code blocks of sop.erl to ease reading and testing.
+
 2.5.0 bonds of actors
 ---------------------
 

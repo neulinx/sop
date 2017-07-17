@@ -88,7 +88,6 @@
          invoke/3,
          attach/2, attach/3,
          detach/2,
-         bind/2,
          access/3,
          perform/5
         ]).
@@ -126,7 +125,6 @@
                    'do' => do_fun() | [do_fun()],
                    '_do' => do_fun(),
                    'pid' => pid(),
-                   'bonds' => bonds(),
                    'entry_time' => timestamp(),
                    'exit_time' => timestamp(),
                    'status' => status(),
@@ -142,7 +140,6 @@
 -type do_fun() :: fun((message() | any(), state()) -> result()).
 -type timestamp() :: integer().  % by unit of microseconds.
 -type status() :: 'running' | tag().
--type bonds() :: 'all' | sets:sets() | function().
 
 %%-- Refined types.
 -type tag() :: any().
@@ -326,6 +323,15 @@ init(State) ->
             {stop, {error, Error}}
     end.
 
+on_entry(#{entry := Entry} = State) when is_function(Entry) ->
+    Entry(State);
+on_entry(#{entry := Entry} = State) ->
+    lists:foldl(fun(F, S) -> F(S) end,
+                State,
+                Entry);
+on_entry(State) ->
+    State.
+
 
 %% Handling sync call messages.
 %% 
@@ -389,6 +395,19 @@ handle_info(Info, State) ->
 
 terminate(Reason, State) ->
     on_exit(State#{reason => Reason, exit_time => timestamp()}).
+
+on_exit(#{exit := Exit} = State) when is_function(Exit) ->
+    Exit(State);
+on_exit(#{exit := Exit} = State) ->
+    lists:foldl(fun(F, S) ->
+                        try
+                            F(S)
+                        catch
+                            _:_ -> S
+                        end
+                end, State, Exit);
+on_exit(State) ->
+    State.
 
 
 %% Convert process state when code is changed
@@ -632,6 +651,16 @@ chain_react(Attribute, Event, State) ->
             on_event(Stack, Event, State)
     end.
 
+on_event([Do | Rest], Info, State) ->
+    case Do(Info, State) of
+        {unhandled, S} ->
+            on_event(Rest, Info, S);
+        Handled ->
+            Handled
+    end;
+on_event([], _, State) ->
+    {unhandled, State}.
+
 
 %%-- sop messages.
 -spec handle(command(), state()) -> result().
@@ -645,8 +674,6 @@ handle({Ref, Result}, State) ->
     handle_result(Ref, Result, State);
 handle({'DOWN', M, _, _, Reason}, State) ->
     handle_result(M, {error, Reason}, State);
-handle({'EXIT', _, _} = Exit, State) ->
-    bind(Exit, State);
 %% Drop unknown messages. Nothing replied.
 handle(_, State) ->
     {noreply, State}.
@@ -699,6 +726,31 @@ request(Command, To, From, State) ->
             perform(Func, Command, Route, From, State);
         {actor, Pid, Sprig} ->
             {relay, {Pid, Sprig}, State}
+    end.
+
+root_do(Command, #{'_do' := R} = State) when is_function(R, 2) ->
+    case R(Command, State) of
+        {unhandled, S} ->
+            do_(Command, S);
+        Result ->
+            Result
+    end;
+root_do(Command, State) ->
+    do_(Command, State).
+
+do_(stop, State) ->
+    {stop, normal, State};
+do_({stop, Reason},  State) ->
+    {stop, Reason, State};
+do_(Command, State) ->
+    case access(Command, [], State) of
+        {result, Res} ->
+            {Res, State};
+        {update, Reply, NewS} when (not is_tuple(Command));
+                                   element(1, Command) =/= put ->
+            {Reply, NewS};
+        _ ->
+            {{error, badarg}, State}
     end.
 
 
@@ -851,7 +903,7 @@ attach(Key, State) ->
 -spec attach(tag(), Value :: any(), state()) -> result().
 attach(Key, Pid, State) when is_pid(Pid) ->
     %% Ignore result of monitors.
-    case invoke({new, Pid}, [monitors, Key], State) of
+    case invoke({new, #{pid => Pid, key => Key}}, [monitors], State) of
         {_, S} ->
             {ok, S#{Key => Pid}};
         Stop ->
@@ -861,9 +913,10 @@ attach(Key, Func, State) when is_function(Func) ->
     {ok, State#{Key => Func}};
 attach(Key, {state, S}, State) ->
     S1 = S#{surname => Key, parent => self()},
-    case start_link(S1) of
+    case start(S1) of
         {ok, Pid} ->
-            case invoke({new, Pid}, [monitors, Key], State) of
+            case invoke({new, #{pid => Pid, key => Key}},
+                        [monitors], State) of
                 {_, State1} ->
                     {ok, State1#{Key => Pid}};
                 Stop ->
@@ -881,7 +934,7 @@ attach(_, _, State) ->
 
 -spec detach(tag(), state()) -> result().
 detach(Key, State) ->
-    case invoke({delete, Key}, [monitors], State) of
+    case invoke(delete, [monitors, Key], State) of
         {_, S} ->
             {ok, maps:remove(Key, S)};
         Stop ->
@@ -889,48 +942,7 @@ detach(Key, State) ->
     end.
 
 
--spec bind(command(), state()) -> result().
-bind(Command, #{bonds := Func} = State) when is_function(Func) ->
-    Func(Command, State);
-bind({'EXIT', _, _} = Reason, #{bonds := all} = State) ->
-    {stop, {shutdown, Reason}, State};
-bind({'EXIT', Pid, _} = Reason, #{bonds := B} = State) ->
-    case sets:is_element(Pid, B) of
-        true ->
-            {stop, {shutdown, Reason}, State};
-        false ->
-            {noreply, State}
-    end;
-bind({'EXIT', _, _}, State) ->
-    {noreply, State};
-bind({assign, Value}, State) ->
-    {ok, State#{bonds => Value}};
-bind(_, #{bonds := all} = State) ->
-    {ok, State};
-bind({new, Pid}, #{bonds := B} = State) ->
-    B1 = sets:add_element(Pid, B),
-    {ok, State#{bonds := B1}};
-bind({new, Pid}, State) ->
-    B = sets:new(),
-    Bonds = sets:add_element(Pid, B),
-    {ok, State#{bonds => Bonds}};
-bind({delete, Pid}, #{bonds := B} = State) ->
-    Bonds = sets:del_element(Pid, B),
-    {ok, State#{bonds => Bonds}};
-bind({delete, _}, State) ->
-    {ok, State};
-bind(_, State) ->
-    {{error, badarg}, State}.
-
-
--spec swap(state()) -> state().
-swap(#{'$state' := S} = Fsm) ->
-    S#{'$fsm' => maps:remove('$state', Fsm)};
-swap(#{'$fsm' := F} = State) ->
-    F#{'$state' => maps:remove('$fsm', State)}.
-
-
-%%- Active attributes.
+%%- Actor behaviors.
 %%------------------------------------------------------------------------------
 %%-- Subscription & notification.
 %% Introduced:
@@ -970,44 +982,75 @@ monitors(get, [Key], #{'_monitors' := M} = State) ->
         {ok, Value} ->
             {Value, State}
     end;
-monitors({new, Pid}, [Key], State) ->
-    M = maps:get('_monitors', State, #{}),
-    Mref = monitor(process, Pid),
-    M1 = M#{Mref => Key, Key => Mref},
-    {Mref, State#{'_monitors' => M1}};
-monitors({delete, all}, [], #{'_monitors' := M} = State) ->
-    maps:fold(fun(Mref, _, _) when is_reference(Mref) ->
-                      demonitor(Mref);
-                 (_, _, _) ->
-                      noop
-              end, 0, M),
-    {ok, maps:remove('_monitors', State)};
-monitors(delete, [Key], #{'_monitors' := M} = State) ->
-    case maps:find(Key, M) of
-        {ok, Ref} when is_reference(Ref) ->
-            demonitor(Ref),
-            M1 = maps:remove(Key, M),
-            M2 = maps:remove(Ref, M1),
-            {Ref, State#{'_monitors' := M2}};
-        {ok, Ref} when is_reference(Key) ->
-            demonitor(Key),
-            M1 = maps:remove(Key, M),
-            M2 = maps:remove(Ref, M1),
-            {Ref, State#{'_monitors' := M2}};
+monitors(delete, [Id], #{'_monitors' := M} = State) ->
+    case maps:find(Id, M) of
+        {ok, #{key := Key} = V} ->
+            case maps:find(type, V) of
+                {ok, link} ->
+                    unlink(Id);
+                _ ->
+                    demonitor(Id)
+            end,
+            M1 = maps:remove(Id, M),
+            M2 = maps:remove(Key, M1),
+            {ok, State#{'_monitors' := M2}};
+        {ok, Ref} ->
+            monitors(delete, [Ref], State);
         error ->
             {{error, undefined}, State}
     end;
-monitors({get, Key}, [], State) ->
-    monitors(get, [Key], State);
-monitors({new, Pid, #{key := Key}}, [], State) ->
-    monitors({new, Pid}, [Key], State);
-monitors({delete, Key}, [], State) ->
-    monitors(delete, [Key], State);
-monitors(Command, Key, State) when not is_list(Key) ->
-    monitors(Command, [Key], State);
+monitors({delete, all}, [], #{'_monitors' := M} = State) ->
+    %% Demonitor only. Unlink is automatically invoked  when actor stopped.
+    maps:fold(fun(Mref, _, _) when is_reference(Mref) ->
+                      demonitor(Mref);
+                 (_, _, _) ->
+                      false
+              end, false, M),
+    {ok, maps:remove('_monitors', State)};
+monitors({new, #{pid := Pid, key := Key} = V}, [], State) ->
+    M = maps:get('_monitors', State, #{}),
+    Id = case maps:find(type, V) of
+             {ok, link} ->
+                 link(Pid),
+                 Pid;
+             _ ->  % default
+                 monitor(process, Pid)
+         end,
+    Monitor = M#{Id => V, Key => Id},
+    {Id, State#{'_monitors' => Monitor}};
+monitors({'DOWN', Mref, _, _, Reason}, [], #{'_monitors' := M} = State) ->
+    case maps:take(Mref, M) of
+        {#{key := Key, bond := true}, M1} ->
+            M2 = maps:remove(Key, M1),
+            S = maps:remove(Key, State#{'_monitors' := M2}),
+            {stop, {shutdown, Reason}, S};
+        {#{key := Key}, M1} ->
+            M2 = maps:remove(Key, M1),
+            S = maps:remove(Key, State#{'_monitors' := M2}),
+            {noreply, S};
+        _ ->
+            {unhandled, State}
+    end;
+monitors({'DOWN', _, _, _, _}, [], State) ->
+    {unhandled, State};
+monitors({'EXIT', Pid, Reason}, [], #{'_monitors' := M} = State) ->
+    case maps:take(Pid, M) of
+        {#{key := Key, bond := true}, M1} ->
+            M2 = maps:remove(Key, M1),
+            S = maps:remove(Key, State#{'_monitors' := M2}),
+            {stop, {shutdown, Reason}, S};
+        {#{key := Key}, M1} ->
+            M2 = maps:remove(Key, M1),
+            S = maps:remove(Key, State#{'_monitors' := M2}),
+            {noreply, S};
+        _ ->
+            {unhandled, State}
+    end;
+monitors({'EXIT', _, _}, [], State) ->
+    {unhandled, State};
 monitors(_, _, State) ->
     {{error, badarg}, State}.
-
+    
 
 -spec links_do(message(), state()) -> result().
 links_do({'$$', _, [links | _], _}, State) ->
@@ -1047,7 +1090,7 @@ monitors_do({'$$', From, [Key], delete}, State) ->
     case maps:take(Key, State) of
         {Pid, S} when is_pid(Pid) ->
             cast(Pid, {'$$detach', Key, self()}),
-            case invoke({delete, Key}, [monitors], S) of
+            case invoke(delete, [monitors, Key], S) of
                 {_, S1} ->
                     reply(From, ok),
                     {noreply, S1};
@@ -1061,20 +1104,13 @@ monitors_do({'$$', From, [Key], delete}, State) ->
             reply(From, {error, undefined}),
             {noreply, State}
     end;
-monitors_do({'DOWN', M, _, _, _}, State) ->
-    case invoke({delete, M}, [monitors], State) of
-        {_, State} ->  % no change
-            {unhandled, State};
-        {{error, _}, S1} ->
-            %%!todo: log error message.
-            {noreply, S1};
-        {Key, S1} ->
-            {noreply, maps:remove(Key, S1)};
-        Stop ->
-            Stop
-    end;
+monitors_do({'DOWN', _, _, _, _} = Down, State) ->
+    invoke(Down, [monitors], State);
+monitors_do({'EXIT', _, _} = Exit, State) ->
+    invoke(Exit, [monitors], State);
 monitors_do(_, State) ->
     {unhandled, State}.
+
 
 
 -spec subscribers_do(message(), state()) -> result().
@@ -1099,6 +1135,22 @@ actor_exit(State) ->
     {_, S1} = invoke({delete, all}, [monitors], S),
     S1.
 
+%% Selective report.
+make_report(all, State) ->
+    State;
+%% Selections is a list of attributes to yield.
+make_report(Selections, State) when is_list(Selections) ->
+    maps:with(Selections, State).
+
+
+%%- Finite State Machine behaviors.
+%%------------------------------------------------------------------------------
+-spec swap(state()) -> state().
+swap(#{'$state' := S} = Fsm) ->
+    S#{'$fsm' => maps:remove('$state', Fsm)};
+swap(#{'$fsm' := F} = State) ->
+    F#{'$state' => maps:remove('$fsm', State)}.
+
 
 %% If $state is present before FSM start, it is an introducer for flexible
 %% initialization.
@@ -1108,77 +1160,6 @@ fsm_do('$$enter', #{'$start' := Start} = Fsm) ->
     transition(Start, Fsm);
 fsm_do(_, Fsm) ->
     {unhandled, Fsm}.
-
-
-%%- Internal functions.
-%%------------------------------------------------------------------------------
-on_entry(#{entry := Entry} = State) when is_function(Entry) ->
-    Entry(State);
-on_entry(#{entry := Entry} = State) ->
-    lists:foldl(fun(F, S) -> F(S) end,
-                State,
-                Entry);
-on_entry(State) ->
-    State.
-
-
-on_exit(#{exit := Exit} = State) when is_function(Exit) ->
-    Exit(State);
-on_exit(#{exit := Exit} = State) ->
-    lists:foldl(fun(F, S) ->
-                        try
-                            F(S)
-                        catch
-                            _:_ -> S
-                        end
-                end, State, Exit);
-on_exit(State) ->
-    State.
-
-
-on_event([Do | Rest], Info, State) ->
-    case Do(Info, State) of
-        {unhandled, S} ->
-            on_event(Rest, Info, S);
-        Handled ->
-            Handled
-    end;
-on_event([], _, State) ->
-    {unhandled, State}.
-
-
-root_do(Command, #{'_do' := R} = State) when is_function(R, 2) ->
-    case R(Command, State) of
-        {unhandled, S} ->
-            do_(Command, S);
-        Result ->
-            Result
-    end;
-root_do(Command, State) ->
-    do_(Command, State).
-
-do_(stop, State) ->
-    {stop, normal, State};
-do_({stop, Reason},  State) ->
-    {stop, Reason, State};
-do_(Command, State) ->
-    case access(Command, [], State) of
-        {result, Res} ->
-            {Res, State};
-        {update, Reply, NewS} when (not is_tuple(Command));
-                                   element(1, Command) =/= put ->
-            {Reply, NewS};
-        _ ->
-            {{error, badarg}, State}
-    end.
-
-
-%% Selective report.
-make_report(all, State) ->
-    State;
-%% Selections is a list of attributes to yield.
-make_report(Selections, State) when is_list(Selections) ->
-    maps:with(Selections, State).
 
 
 %%!todo: archive historic states as traces.
