@@ -88,6 +88,7 @@
          invoke/3,
          attach/2, attach/3,
          detach/2,
+         bind/2,
          access/3,
          perform/5
         ]).
@@ -125,6 +126,7 @@
                    'do' => do_fun() | [do_fun()],
                    '_do' => do_fun(),
                    'pid' => pid(),
+                   'bonds' => bonds(),
                    'entry_time' => timestamp(),
                    'exit_time' => timestamp(),
                    'status' => status(),
@@ -140,6 +142,7 @@
 -type do_fun() :: fun((message() | any(), state()) -> result()).
 -type timestamp() :: integer().  % by unit of microseconds.
 -type status() :: 'running' | tag().
+-type bonds() :: 'all' | sets:sets() | function().
 
 %%-- Refined types.
 -type tag() :: any().
@@ -642,6 +645,8 @@ handle({Ref, Result}, State) ->
     handle_result(Ref, Result, State);
 handle({'DOWN', M, _, _, Reason}, State) ->
     handle_result(M, {error, Reason}, State);
+handle({'EXIT', _, _} = Exit, State) ->
+    bind(Exit, State);
 %% Drop unknown messages. Nothing replied.
 handle(_, State) ->
     {noreply, State}.
@@ -651,8 +656,10 @@ handle_result(Ref, Result, #{pending_calls := Q} = State) ->
     %% function.
     case maps:take(Ref, Q) of
         {{Func, Arg}, Q1} ->
+            catch demonitor(Ref),
             Func(Result, Arg, State#{pending_calls := Q1});
         {Callbacks, Q1} when is_list(Callbacks) ->
+            catch demonitor(Ref),
             State1 = lists:foldl(fun({F, A}, {R, S}) -> F(R, A, S) end,
                                  {Result, State#{pending_calls := Q1}},
                                  Callbacks),
@@ -865,7 +872,7 @@ attach(Key, {state, S}, State) ->
         Error ->
             {Error, S1}
     end;
-%% To accept pid or state data.
+%% To accept pid() or {state, any()} Value as raw data.
 attach(Key, {data, Value}, State) ->
     {ok, State#{Key => Value}};
 attach(_, _, State) ->
@@ -880,6 +887,40 @@ detach(Key, State) ->
         Stop ->
             Stop
     end.
+
+
+-spec bind(command(), state()) -> result().
+bind(Command, #{bonds := Func} = State) when is_function(Func) ->
+    Func(Command, State);
+bind({'EXIT', _, _} = Reason, #{bonds := all} = State) ->
+    {stop, {shutdown, Reason}, State};
+bind({'EXIT', Pid, _} = Reason, #{bonds := B} = State) ->
+    case sets:is_element(Pid, B) of
+        true ->
+            {stop, {shutdown, Reason}, State};
+        false ->
+            {noreply, State}
+    end;
+bind({'EXIT', _, _}, State) ->
+    {noreply, State};
+bind({assign, Value}, State) ->
+    {ok, State#{bonds => Value}};
+bind(_, #{bonds := all} = State) ->
+    {ok, State};
+bind({new, Pid}, #{bonds := B} = State) ->
+    B1 = sets:add_element(Pid, B),
+    {ok, State#{bonds := B1}};
+bind({new, Pid}, State) ->
+    B = sets:new(),
+    Bonds = sets:add_element(Pid, B),
+    {ok, State#{bonds => Bonds}};
+bind({delete, Pid}, #{bonds := B} = State) ->
+    Bonds = sets:del_element(Pid, B),
+    {ok, State#{bonds => Bonds}};
+bind({delete, _}, State) ->
+    {ok, State};
+bind(_, State) ->
+    {{error, badarg}, State}.
 
 
 -spec swap(state()) -> state().
@@ -1090,9 +1131,7 @@ on_exit(#{exit := Exit} = State) ->
                         catch
                             _:_ -> S
                         end
-                end,
-                State,
-                Exit);
+                end, State, Exit);
 on_exit(State) ->
     State.
 

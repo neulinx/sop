@@ -1,6 +1,12 @@
 CHANGELOG
 =========
 
+2.5.0 bonds of actors
+---------------------
+
+- Fix minor issue of asyn_call cleanup: try demonitor anyway.
+- Add `bonds` attribute to implement links of processes.
+
 2.4.0 Internal call support asynchronous mode
 ---------------------------------------------
 
