@@ -1,6 +1,17 @@
 CHANGELOG
 =========
 
+v2.6.0, add bonds as fatal links support.
+-----------------------------------------
+
+- Simplify launcher of start functions.
+  - Only start/1 left.
+  - Add `run_mode`, `register_name`, `start_options`.
+  - Remove `actor_entry/1` action.
+- Add bonds attribute for fatal links.
+- Add helpers for bonds operation.
+- `detach/2` return attribute value now.
+
 v2.5.2, actor add work_mode.
 ----------------------------
 

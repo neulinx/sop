@@ -29,12 +29,9 @@
          code_change/3
         ]).
 
-%% Launcher.
--export([start/1, start/2, start/3,
-         start_link/1, start_link/2, start_link/3
-        ]).
-%% Creator.
--export([create/1, create/2,
+%% Launcher and creator.
+-export([start/1,
+         create/1, create/2,
          from_module/2
         ]).
 
@@ -88,6 +85,8 @@
          invoke/3,
          attach/2, attach/3,
          detach/2,
+         bind/2,
+         unbind/2,
          access/3,
          perform/5
         ]).
@@ -106,8 +105,7 @@
 %%-- Definitions for gen_server.
 -type server_name() :: {local, atom()} |
                        {global, atom()} |
-                       {via, atom(), term()} |
-                       'undefined'.
+                       {via, atom(), term()}.
 -type start_ret() ::  {'ok', pid()} | 'ignore' | {'error', term()}.
 -type start_opt() :: {'timeout', timeout()} |
                      {'spawn_opt', [proc_lib:spawn_option()]}.
@@ -122,6 +120,10 @@
                    'status' => status(),
                    'timeout' => timeout(),
                    'pending_calls' => #{reference() => callback()},
+                   'bonds' => 'all' | sets:sets(),
+                   'start_options' => start_opt(),
+                   'register_name' => server_name(),
+                   'run_mode' => 'solo' | 'aggregation',
                    tag() => dynamic_attribute() | any()
                   }.
 
@@ -179,49 +181,21 @@
 
 %%- Starts the server
 %%------------------------------------------------------------------------------
--spec start_link(state()) -> start_ret().
-start_link(State) ->
-    start_link(State, []).
-
--spec start_link(state(), [start_opt()]) -> start_ret().
-start_link(State, Options) ->
-    Opts = merge_options(Options, State),
-    gen_server:start_link(?MODULE, State, Opts).
-
--spec start_link(server_name(), state(), [start_opt()]) -> start_ret().
-start_link(undefined, State, Options) ->
-    start_link(State, Options);
-start_link(Name, State, Options) ->
-    Opts = merge_options(Options, State),
-    gen_server:start_link(Name, ?MODULE, State, Opts).
-
-
 -spec start(state()) -> start_ret().
 start(State) ->
-    start(State, []).
-
--spec start(state(), [start_opt()]) -> start_ret().
-start(State, Options) ->
-    Opts = merge_options(Options, State),
-    gen_server:start(?MODULE, State, Opts).
-
--spec start(server_name(), state(), [start_opt()]) -> start_ret().
-start(undefined, State, Options) ->
-    start(State, Options);
-start(Name, State, Options) ->
-    Opts = merge_options(Options, State),
-    gen_server:start(Name, ?MODULE, State, Opts).
-
-%% If option {timeout,Time} is present, the gen_server process is allowed to
-%% spend $Time milliseconds initializing or it is terminated and the start
-%% function returns {error,timeout}.
-merge_options(Options, State) ->
-    case proplists:is_defined(timeout, Options) of
-        true ->
-            Options;
-        false ->
-            Timeout = maps:get(timeout, State, ?DFL_TIMEOUT),
-            Options ++ [{timeout, Timeout}]
+    Opts = maps:get(start_options, State, []),
+    Solo = ({ok, solo} =:= maps:find(run_mode, State)),
+    case maps:find(register_name, State) of
+        {ok, Name} when Solo ->
+            gen_server:start(Name, ?MODULE, State, Opts);
+        {ok, Name} ->
+            S = add_bond(self(), State),
+            gen_server:start_link(Name, ?MODULE, S, Opts);
+        error when Solo ->
+            gen_server:start(?MODULE, State, Opts);
+        error ->
+            S = add_bond(self(), State),
+            gen_server:start_link(?MODULE, S, Opts)
     end.
 
 
@@ -242,7 +216,6 @@ create(actor, Data) ->
     Actor = #{subscribers => fun subscribers/3,
               monitors => fun monitors/3,
               do => [fun links_do/2, fun monitors_do/2, fun subscribers_do/2],
-              entry => fun actor_entry/1,
               exit => fun actor_exit/1
              },
     merge(Actor, Data);
@@ -667,6 +640,8 @@ handle({Ref, Result}, State) ->
     handle_result(Ref, Result, State);
 handle({'DOWN', M, _, _, Reason}, State) ->
     handle_result(M, {error, Reason}, State);
+handle({'EXIT', _, _} = Break, State) ->
+    handle_break(Break, State);
 %% Drop unknown messages. Nothing replied.
 handle(_, State) ->
     {noreply, State}.
@@ -688,6 +663,18 @@ handle_result(Ref, Result, #{pending_calls := Q} = State) ->
             {noreply, State}
     end;
 handle_result(_, _, State) ->
+    {noreply, State}.
+
+handle_break(Break, #{critical_links := all} = State) ->
+    {stop, {shutdown, Break}, State};
+handle_break({_, Pid, _} = Break, #{critical_links := Cl} = State) ->
+    case sets:is_element(Pid, Cl) of
+        true ->
+            {stop, {shutdown, Break}, State};
+        false ->
+            {noreply, State}
+    end;
+handle_break(_, State) ->
     {noreply, State}.
 
 %%-- Reply and normalize result of request.
@@ -932,10 +919,44 @@ attach(_, _, State) ->
 detach(Key, State) ->
     case invoke(delete, [monitors, Key], State) of
         {_, S} ->
-            {ok, maps:remove(Key, S)};
+            case maps:take(Key, S) of
+                error ->
+                    {ok, S};
+                Result ->
+                    Result
+            end;
         Stop ->
             Stop
     end.
+
+
+-spec bind(pid(), state()) -> state().
+bind(Pid, State) ->
+    true = link(Pid),
+    add_bond(Pid, State).
+
+-spec unbind(pid(), state()) -> state().
+unbind(Pid, State) ->
+    unlink(Pid),
+    remove_bond(Pid, State).
+
+add_bond(_, #{bonds := all} = State) ->
+    State;
+add_bond(Pid, #{bonds := B} = State) ->
+    B1 = sets:add_element(Pid, B),
+    State#{bonds := B1};
+add_bond(Pid, State) ->
+    B = sets:new(),
+    B1 = sets:add_element(Pid, B),
+    State#{bonds => B1}.
+
+remove_bond(_, #{bonds := all} = State) ->
+    State;
+remove_bond(Pid, #{bonds := B} = State) ->
+    B1 = sets:del_element(Pid, B),
+    State#{bonds := B1};
+remove_bond(_, State) ->
+    State.
 
 
 %%- Actor behaviors.
@@ -1094,13 +1115,6 @@ subscribers_do({'DOWN', M, _, _, _}, State) ->
 subscribers_do(_, State) ->
     {unhandled, State}.
 
-actor_entry(#{parent := Pid} = State) ->
-    Standalone =  maps:get(work_mode, State, cluster),
-    {_, S} = invoke({new, {parent, Pid, Standalone =/= standalone}},
-                    [monitors], State),
-    S;
-actor_entry(State) ->
-    State.
 
 %% Goodbye, subscribers! And submit leave report.
 actor_exit(State) ->
