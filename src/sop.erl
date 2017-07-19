@@ -92,14 +92,6 @@
          perform/5
         ]).
 
-%%-- Actions
--export([monitors/3,
-         subscribers/3,
-         links_do/2,
-         monitors_do/2,
-         subscribers_do/2
-        ]).
-
 
 %%- Types.
 %%------------------------------------------------------------------------------
@@ -250,6 +242,7 @@ create(actor, Data) ->
     Actor = #{subscribers => fun subscribers/3,
               monitors => fun monitors/3,
               do => [fun links_do/2, fun monitors_do/2, fun subscribers_do/2],
+              entry => fun actor_entry/1,
               exit => fun actor_exit/1
              },
     merge(Actor, Data);
@@ -754,6 +747,10 @@ do_(Command, State) ->
     end.
 
 
+%% get, delete and put with [Key] is handled by the parent attribute, not by the
+%% Key attribute. patch and new methods with [Key] are odd, they are handled by
+%% Key attribute when it is active (function or process) while they are handled
+%% by parent when Key attribute is map type.
 -spec access(command(), target(), Package :: any()) -> 
                     {'result', any()} |
                     {'update', tag(), any()} |
@@ -902,10 +899,9 @@ attach(Key, State) ->
 
 -spec attach(tag(), Value :: any(), state()) -> result().
 attach(Key, Pid, State) when is_pid(Pid) ->
-    %% Ignore result of monitors.
-    case invoke({new, #{pid => Pid, key => Key}}, [monitors], State) of
+    case invoke({new, {Key, Pid}}, [monitors], State#{Key => Pid}) of
         {_, S} ->
-            {ok, S#{Key => Pid}};
+            {ok, S};
         Stop ->
             Stop
     end;
@@ -915,15 +911,15 @@ attach(Key, {state, S}, State) ->
     S1 = S#{surname => Key, parent => self()},
     case start(S1) of
         {ok, Pid} ->
-            case invoke({new, #{pid => Pid, key => Key}},
-                        [monitors], State) of
+            case invoke({new, {Key, Pid}},
+                        [monitors], State#{Key => Pid}) of
                 {_, State1} ->
-                    {ok, State1#{Key => Pid}};
+                    {ok, State1};
                 Stop ->
                     Stop
             end;
         Error ->
-            {Error, S1}
+            {Error, State}
     end;
 %% To accept pid() or {state, any()} Value as raw data.
 attach(Key, {data, Value}, State) ->
@@ -975,8 +971,8 @@ subscribers(_, _, State) ->
 
 
 -spec monitors(command(), path(), state()) -> result().
-monitors(get, [Key], #{'_monitors' := M} = State) ->
-    case maps:find(Key, M) of
+monitors(get, [Id], #{'_monitors' := M} = State) ->
+    case maps:find(Id, M) of
         error ->
             {{error, undefined}, State};
         {ok, Value} ->
@@ -984,73 +980,60 @@ monitors(get, [Key], #{'_monitors' := M} = State) ->
     end;
 monitors(delete, [Id], #{'_monitors' := M} = State) ->
     case maps:find(Id, M) of
-        {ok, #{key := Key} = V} ->
-            case maps:find(type, V) of
-                {ok, link} ->
-                    unlink(Id);
-                _ ->
-                    demonitor(Id)
-            end,
-            M1 = maps:remove(Id, M),
+        {ok, {Mref, Key, _}} ->
+            demonitor(Mref),
+            M1 = maps:remove(Mref, M),
             M2 = maps:remove(Key, M1),
             {ok, State#{'_monitors' := M2}};
-        {ok, Ref} ->
-            monitors(delete, [Ref], State);
         error ->
             {{error, undefined}, State}
     end;
-monitors({delete, all}, [], #{'_monitors' := M} = State) ->
-    %% Demonitor only. Unlink is automatically invoked  when actor stopped.
-    maps:fold(fun(Mref, _, _) when is_reference(Mref) ->
-                      demonitor(Mref);
+monitors({delete, all}, [], State) ->
+    %% Cleanup but do not demonitor. Monitors can be released when process
+    %% exiting.
+    {ok, maps:remove('_monitors', State)};
+monitors({demonitor, all}, [], #{'_monitors' := M} = State) ->
+    %% Demonitor and remove all monitors. 'DOWN' message will not be fired when
+    %% current actor process stopped.
+    maps:fold(fun(Mref, {Mref, _, _}, _) ->
+                      demonitor(Mref, [flush]);
                  (_, _, _) ->
                       false
               end, false, M),
     {ok, maps:remove('_monitors', State)};
-monitors({new, #{pid := Pid, key := Key} = V}, [], State) ->
+monitors({new, V}, [], State) ->
     M = maps:get('_monitors', State, #{}),
-    Id = case maps:find(type, V) of
-             {ok, link} ->
-                 link(Pid),
-                 Pid;
-             _ ->  % default
-                 monitor(process, Pid)
-         end,
-    Monitor = M#{Id => V, Key => Id},
-    {Id, State#{'_monitors' => Monitor}};
+    {Ref, M1} = new_monitor(V, M),
+    {Ref, State#{'_monitors' => M1}};
 monitors({'DOWN', Mref, _, _, Reason}, [], #{'_monitors' := M} = State) ->
     case maps:take(Mref, M) of
-        {#{key := Key, bond := true}, M1} ->
+        {{Mref, Key, true}, M1} ->
+            %% Remove monitor but keep Key in State.
             M2 = maps:remove(Key, M1),
-            S = maps:remove(Key, State#{'_monitors' := M2}),
-            {stop, {shutdown, Reason}, S};
-        {#{key := Key}, M1} ->
+            {_, S1} = invoke(delete, Key, State#{'_monitors' := M2}),
+            {stop, {shutdown, Reason}, S1};
+        {{Mref, Key, false}, M1} ->
             M2 = maps:remove(Key, M1),
-            S = maps:remove(Key, State#{'_monitors' := M2}),
-            {noreply, S};
+            {_, S1} = invoke(delete, Key, State#{'_monitors' := M2}),
+            {noreply, S1};
         _ ->
             {unhandled, State}
     end;
 monitors({'DOWN', _, _, _, _}, [], State) ->
     {unhandled, State};
-monitors({'EXIT', Pid, Reason}, [], #{'_monitors' := M} = State) ->
-    case maps:take(Pid, M) of
-        {#{key := Key, bond := true}, M1} ->
-            M2 = maps:remove(Key, M1),
-            S = maps:remove(Key, State#{'_monitors' := M2}),
-            {stop, {shutdown, Reason}, S};
-        {#{key := Key}, M1} ->
-            M2 = maps:remove(Key, M1),
-            S = maps:remove(Key, State#{'_monitors' := M2}),
-            {noreply, S};
-        _ ->
-            {unhandled, State}
-    end;
-monitors({'EXIT', _, _}, [], State) ->
-    {unhandled, State};
 monitors(_, _, State) ->
     {{error, badarg}, State}.
-    
+
+new_monitor({Key, Pid, Bond}, M) when is_pid(Pid) ->
+    Mref = monitor(process, Pid),
+    V = {Mref, Key, Bond},
+    {Mref, M#{Mref => V, Key => V}};
+new_monitor({Key, Mref, Bond}, M) ->
+    V = {Mref, Key, Bond},
+    {Mref, M#{Mref =>V, Key => V}};
+new_monitor({K, V}, M) ->
+    new_monitor({K, V, false}, M).
+
 
 -spec links_do(message(), state()) -> result().
 links_do({'$$', _, [links | _], _}, State) ->
@@ -1086,31 +1069,17 @@ links_do(_, State) ->
 
 
 -spec monitors_do(message(), state()) -> result().
-monitors_do({'$$', From, [Key], delete}, State) ->
-    case maps:take(Key, State) of
-        {Pid, S} when is_pid(Pid) ->
-            cast(Pid, {'$$detach', Key, self()}),
-            case invoke(delete, [monitors, Key], S) of
-                {_, S1} ->
-                    reply(From, ok),
-                    {noreply, S1};
-                Stop ->
-                    Stop
-            end;
+monitors_do({'$$', _, Key, delete}, State) ->
+    case invoke(delete, [monitors, Key], State) of
         {_, S} ->
-            reply(From, ok),
-            {noreply, S};
-        error ->
-            reply(From, {error, undefined}),
-            {noreply, State}
+            {unhandled, S};
+        Stop ->
+            Stop
     end;
 monitors_do({'DOWN', _, _, _, _} = Down, State) ->
     invoke(Down, [monitors], State);
-monitors_do({'EXIT', _, _} = Exit, State) ->
-    invoke(Exit, [monitors], State);
 monitors_do(_, State) ->
     {unhandled, State}.
-
 
 
 -spec subscribers_do(message(), state()) -> result().
@@ -1125,6 +1094,13 @@ subscribers_do({'DOWN', M, _, _, _}, State) ->
 subscribers_do(_, State) ->
     {unhandled, State}.
 
+actor_entry(#{parent := Pid} = State) ->
+    Standalone =  maps:get(work_mode, State, cluster),
+    {_, S} = invoke({new, {parent, Pid, Standalone =/= standalone}},
+                    [monitors], State),
+    S;
+actor_entry(State) ->
+    State.
 
 %% Goodbye, subscribers! And submit leave report.
 actor_exit(State) ->

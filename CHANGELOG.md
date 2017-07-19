@@ -1,6 +1,13 @@
 CHANGELOG
 =========
 
+v2.5.2, actor add work_mode.
+----------------------------
+
+- Do not export actions.
+- Add actor_entry to monitor parent.
+- Unified monitor, do not support link.
+
 v2.5.1, merge bonds to monitors.
 --------------------------------
 
