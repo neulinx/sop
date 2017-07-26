@@ -1,6 +1,20 @@
 CHANGELOG
 =========
 
+v2.6.2, avoid confusion of 'get', 'put', 'delete' actions.
+----------------------------------------------------------
+
+- fun invoke/3 support {refer, Target, Command, State} format result.
+- When options of get, put, delete is 'raw', operate the raw data of attribute
+  value directly.
+
+v2.6.1, change `relay` to `refer`.
+----------------------------------
+
+- Spell of `relay` is too close to `reply`. 
+- Now support result format of {refer, Target, NewCommand, State} to alert
+  request data.
+
 v2.6.0, add bonds as fatal links support.
 -----------------------------------------
 

@@ -81,7 +81,7 @@
          state_call/3,
          asyn_call/4,
          asyn_call/5,
-         relay/4,
+         refer/4,
          invoke/3,
          attach/2, attach/3,
          detach/2,
@@ -140,10 +140,11 @@
 -type pass() :: 'ok' | 'noreply' | 'unhandled' | any().
 -type fail() :: {'error', Error :: any()}.
 -type reply() :: pass() | fail().
--type relay() :: {'relay', target(), state()}.
+-type refer() :: {'refer', target(), state()} |
+                 {'refer', target(), command(), state()}. 
 -type stop() :: {'stop', Reason :: any(), state()} |
                 {'stop', Reason :: any(), reply(), state()}.
--type result() :: {reply(), state()} | relay() | stop().
+-type result() :: {reply(), state()} | refer() | stop().
 -type cb_func() :: fun((reply(), Args :: any(), state()) -> state()).
 -type callback() :: {cb_func(), Args :: any()}.
 -type position() :: 'head' | 'tail' | integer().
@@ -341,7 +342,7 @@ handle_info(Info, State) ->
     case chain_react(do, Info, State) of
         {unhandled, S} ->
             handle(Info, S);
-        {relay, NextHop, S} ->
+        {refer, NextHop, S} ->
             catch NextHop ! Info,
             {noreply, S};
         Result ->
@@ -683,8 +684,10 @@ response(_, _, {noreply, NewState}) ->
 response(_, Caller, {Reply, NewState}) ->
     reply(Caller, Reply),
     {noreply, NewState};
-response(Command, Caller, {relay, Target, NewState}) ->
-    relay(Caller, Target, Command, NewState);
+response(Command, Caller, {refer, Target, NewState}) ->
+    refer(Caller, Target, Command, NewState);
+response(_, Caller, {refer, Target, Command, NewState}) ->
+    refer(Caller, Target, Command, NewState);
 response(_, Caller, {stop, Reason, NewState}) ->
     reply(Caller, stopping),
     {stop, Reason, NewState};
@@ -705,7 +708,7 @@ request(Command, To, From, State) ->
         {action, Func, Route} ->
             perform(Func, Command, Route, From, State);
         {actor, Pid, Sprig} ->
-            {relay, {Pid, Sprig}, State}
+            {refer, {Pid, Sprig}, State}
     end.
 
 root_do(Command, #{'_do' := R} = State) when is_function(R, 2) ->
@@ -723,6 +726,7 @@ do_(stop, State) ->
 do_({stop, Reason},  State) ->
     {stop, Reason, State};
 do_(Command, State) ->
+    %% Support: get, {get, Selection}, {patch, Value}, {new, Value}
     case access(Command, [], State) of
         {result, Res} ->
             {Res, State};
@@ -744,6 +748,19 @@ do_(Command, State) ->
                     {'delete', 'ok'} |
                     {'action', function()} |
                     {'actor', pid()}.
+%%--- Raw value of the attribute.
+access({get, raw}, [], Data) ->
+    {result, Data};
+access({put, Value, raw}, [], _) ->
+    {update, ok, Value};
+access({delete, raw}, [], _) ->
+    {delete, ok};
+%%--- Active attributes.
+access(_, Sprig, Data) when is_function(Data) ->
+    {action, Data, Sprig};
+access(_, Sprig, Data) when is_pid(Data) ->
+    {actor, Data, Sprig};
+%%--- The value of attribute or map type attributes.
 access(get, [], Data) ->
     {result, Data};
 access({put, Value}, [], _) ->
@@ -751,19 +768,19 @@ access({put, Value}, [], _) ->
 access(delete, [], _) ->
     {delete, ok};
 access({get, Selection}, [], Data)
-  when is_list(Selection) andalso is_map(Data) ->
+  when is_list(Selection) ->
     Value = maps:with(Selection, Data),
     {result, Value};
 access({patch, Value}, [], Data)
-  when is_map(Value) andalso is_map(Data) ->
+  when is_map(Value) ->
     NewData = maps:merge(Data, Value),
     {update, ok, NewData};
-access({new, Value, #{key := Key}}, [], Data) when is_map(Data) ->
+access({new, Value, #{key := Key}}, [], Data) ->
     {update, Key, Data#{Key => Value}};
-access({new, Value}, [], Data) when is_map(Data) ->
+access({new, Value}, [], Data) ->
     {Key, NewData} = new_attribute(Value, Data),
     {update, Key, NewData};
-access(Command, [Key | Rest], Data) when is_map(Data) ->
+access(Command, [Key | Rest], Data) ->
     case maps:find(Key, Data) of
         {ok, Value} ->
             case access(Command, Rest, Value) of
@@ -777,12 +794,9 @@ access(Command, [Key | Rest], Data) when is_map(Data) ->
         error ->
             {result, {error, undefined}}
     end;
-access(_, Sprig, Data) when is_function(Data) ->
-    {action, Data, Sprig};
-access(_, Sprig, Data) when is_pid(Data) ->
-    {actor, Data, Sprig};
 access(_, [], _) ->
     {result, {error, badarg}};
+%% Wrap Key into path list.
 access(Command, Key, State) ->
     access(Command, [Key], State).
 
@@ -798,13 +812,13 @@ perform(Func, _, _, _, State) ->
     Func(State).
 
 
--spec relay(from(), To :: target(), command(), state()) -> result().
-relay(Caller, Path, Command, State) when is_list(Path) ->
+-spec refer(from(), To :: target(), command(), state()) -> result().
+refer(Caller, Path, Command, State) when is_list(Path) ->
     handle_info({'$$', Caller, Path, Command}, State);
-relay(Caller, {Process, Path}, Command, State) ->
+refer(Caller, {Process, Path}, Command, State) ->
     catch Process ! {'$$', Caller, Path, Command},
     {noreply, State};
-relay(Caller, Process, Command, State) ->
+refer(Caller, Process, Command, State) ->
     catch Process ! {'$$', Caller, [], Command},
     {noreply, State}.
 
@@ -820,10 +834,14 @@ invoke(Command, Path, State) ->
         {action, Func, Route} ->
             %% Caller is call means neither aynchronous return nor forwarding.
             case perform(Func, Command, Route, call, State) of
-                {relay, Next, S} when is_list(Next) ->
+                {refer, Next, S} when is_list(Next) ->
                     invoke(Command, Next, S);
-                {relay, Next, S} ->
+                {refer, Next, S} ->
                     state_call(Next, Command, S);
+                {refer, Next, NewCmd, S} when is_list(Next) ->
+                    invoke(NewCmd, Next, S);
+                {refer, Next, NewCmd, S} ->
+                    state_call(Next, NewCmd, S);
                 Result ->
                     Result
             end;
@@ -1026,16 +1044,16 @@ monitors({new, V}, [], State) ->
     M = maps:get('_monitors', State, #{}),
     {Ref, M1} = new_monitor(V, M),
     {Ref, State#{'_monitors' => M1}};
-monitors({'DOWN', Mref, _, _, Reason}, [], #{'_monitors' := M} = State) ->
+monitors({'DOWN', Mref, _, _Pid, Reason}, [], #{'_monitors' := M} = State) ->
     case maps:take(Mref, M) of
         {{Mref, Key, true}, M1} ->
             %% Remove monitor but keep Key in State.
             M2 = maps:remove(Key, M1),
-            {_, S1} = invoke(delete, Key, State#{'_monitors' := M2}),
+            {_, S1} = invoke({delete, raw}, Key, State#{'_monitors' := M2}),
             {stop, {shutdown, Reason}, S1};
         {{Mref, Key, false}, M1} ->
             M2 = maps:remove(Key, M1),
-            {_, S1} = invoke(delete, Key, State#{'_monitors' := M2}),
+            {_, S1} = invoke({delete, raw}, Key, State#{'_monitors' := M2}),
             {noreply, S1};
         _ ->
             {unhandled, State}
@@ -1083,7 +1101,7 @@ links_do({'$$', From, [Key | _] = Path, Command}, #{links := L} = State) ->
                     end
             end;
         false ->
-            relay(From, [links | Path], Command, State)
+            refer(From, [links | Path], Command, State)
     end;
 links_do(_, State) ->
     {unhandled, State}.
