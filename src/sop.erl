@@ -30,17 +30,14 @@
         ]).
 
 %% Launcher and creator.
--export([start/1,
-         create/1, create/2,
-         from_module/2
-        ]).
+-export([start/1, create/1, create/2]).
 
 %%-- Message helpers.
 %% Generic.
--export([reply/2,
-         call/2, call/3, call/4,
+-export([call/2, call/3, call/4,
          cast/2, cast/3,
-         act/2, act/3
+         reply/2,
+         relay/3, relay/4
         ]).
 
 %% Operations.
@@ -70,11 +67,8 @@
 -export([chain/2,
          chain_action/3, chain_action/4,
          chain_actions/3,
-         chain_react/3,
          chain_callback/4,
-         enqueue_callback/3,
-         merge/2,
-         swap/1
+         merge/2
         ]).
 %% Internal process.
 -export([handle/2,
@@ -87,8 +81,7 @@
          detach/2,
          bind/2,
          unbind/2,
-         access/3,
-         perform/5
+         access/3
         ]).
 
 
@@ -99,6 +92,7 @@
               result/0,
               message/0,
               from/0,
+              target/0,
               process/0
              ]).
 
@@ -200,6 +194,7 @@ start(State) ->
     end.
 
 
+%%!future: merge create function into entry to unify state object factory.
 -spec create(actor_type()) -> state().
 create(Type) ->
     create(Type, #{}).
@@ -224,6 +219,8 @@ create(actor, Data) ->
 create(thing, Data) ->
     Actor = create(actor, Data),
     chain_action(Actor, do, fun fsm_do/2);
+create(Forge, Data) when is_function(Forge) ->
+    Forge(Data);
 create(Module, Data) ->
     from_module(Module, Data).
 
@@ -388,14 +385,6 @@ code_change(_OldVsn, State, _Extra) ->
 
 %%- Message processing.
 %%------------------------------------------------------------------------------
--spec reply({tag(), reference()}, Reply :: any()) -> 'ok'.
-reply({To, Tag}, Reply) ->
-    catch To ! {Tag, Reply},
-    ok;
-reply(_, _) ->
-    ok.
-
-
 -spec call(target(), command()) -> reply().
 call([Process | Path], Command) ->
     call(Process, Path, Command, ?DFL_TIMEOUT);
@@ -444,14 +433,26 @@ cast(Process, Path, Message) ->
     ok.
 
 
--spec act(tag(), target()) -> reply().
-act(Action, Target) ->
-    act(Action, Target, []).
+-spec reply({tag(), reference()}, Reply :: any()) -> 'ok'.
+reply({To, Tag}, Reply) ->
+    catch To ! {Tag, Reply},
+    ok;
+reply(_, _) ->
+    ok.
 
--spec act(tag(), target(), Args :: any()) -> reply().
-act(Action, Target, Args) ->
-    Path = chain(Target, Action),
-    call(Path, Args).
+
+-spec relay(from(), target(), command()) -> 'ok'.
+relay(From, [To | Path], Command) ->
+    relay(From, To, Path, Command);
+relay(From, {To, Path}, Command) ->
+    relay(From, To, Path, Command);
+relay(From, To, Command) ->
+    relay(From, To, [], Command).
+
+-spec relay(from(), process(), path(), command()) -> 'ok'.
+relay(From, To, Path, Command) ->
+    catch To ! {'$$', From, Path, Command},
+    ok.
 
 
 %%-- Data access.
@@ -652,19 +653,40 @@ handle_result(Ref, Result, #{pending_calls := Q} = State) ->
     %% function.
     case maps:take(Ref, Q) of
         {{Func, Arg}, Q1} ->
-            catch demonitor(Ref),
-            Func(Result, Arg, State#{pending_calls := Q1});
+            case Func(Result, Arg, State) of
+                {done, State1} ->
+                    catch demonitor(Ref),
+                    {noreply, State1#{pending_calls := Q1}};
+                {pending, State1} ->
+                    {noreply, State1};
+                Stop -> % should be stop result.
+                    Stop
+            end;
         {Callbacks, Q1} when is_list(Callbacks) ->
-            catch demonitor(Ref),
-            State1 = lists:foldl(fun({F, A}, {R, S}) -> F(R, A, S) end,
-                                 {Result, State#{pending_calls := Q1}},
-                                 Callbacks),
-            {noreply, State1};
+            case lists:foldr(fun do_callbacks/2,
+                             {Result, State, []}, Callbacks) of
+                {_, State1, []} ->
+                    catch demonitor(Ref),
+                    {noreply, State1#{pending_calls := Q1}};
+                {_, State1, Rest} ->
+                    Q2 = Q#{Ref := Rest},
+                    {noreply, State1#{pending_calls := Q2}}
+            end;
         _ ->  % do nothing and keep State untouched.
             {noreply, State}
     end;
 handle_result(_, _, State) ->
     {noreply, State}.
+
+do_callbacks({F, A}, {R, S, L}) ->
+    case F(R, A, S) of
+        {done, S1} ->
+            {R, S1, L};
+        {pending, S1} ->
+            {R, S1, [{F, A} | L]};
+        {stop, Reason, _} ->
+            exit(Reason)
+    end.
 
 handle_break(Break, #{critical_links := all} = State) ->
     {stop, {shutdown, Break}, State};

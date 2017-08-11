@@ -1,6 +1,15 @@
 CHANGELOG
 =========
 
+2.7.0, enhance asyn_call function.
+----------------------------------
+
+- Remove unused exported functions.
+- Add relay function to forward request to another actor.
+- Add factory support in create function.
+- `asyn_call` support sticky mode.
+- Callback function of `asyn_call` return `{pending, S}`/`{done, S}`.
+
 v2.6.2, avoid confusion of 'get', 'put', 'delete' actions.
 ----------------------------------------------------------
 
