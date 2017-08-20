@@ -1,7 +1,26 @@
 CHANGELOG
 =========
 
-2.7.0, enhance asyn_call function.
+2.8.0, finite state machine, unit test passed.
+----------------------------------------------
+
+- Fix bug of bonds.
+- Default timeout value of function call changed to `infinity`.
+- Remove `_do` callback.
+- Change `$start` to `start` and make it as start event of FSM and thing.
+- Remove call/4, cast/3.
+- create/2 function is enhanced by enable/2 function.
+- create from module now support all attributes and exported functions of the
+  module.
+- Seperate functionalities of thing, such as link, monitor, subscribe.
+- Now fsm support notifications.
+- Export template() type.
+- Fix bug of `chain_action` Position parameter.
+- Fix bug of state transition notify.
+- Add syntex sugar of FSM state action.
+- Change the order of fsm and thing behaviors, move fsm_do the the tail.
+
+v2.7.0, enhance asyn_call function.
 ----------------------------------
 
 - Remove unused exported functions.

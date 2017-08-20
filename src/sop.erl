@@ -34,8 +34,8 @@
 
 %%-- Message helpers.
 %% Generic.
--export([call/2, call/3, call/4,
-         cast/2, cast/3,
+-export([call/2, call/3,
+         cast/2,
          reply/2,
          relay/3, relay/4
         ]).
@@ -93,7 +93,8 @@
               message/0,
               from/0,
               target/0,
-              process/0
+              process/0,
+              template/0
              ]).
 
 %%-- Definitions for gen_server.
@@ -107,7 +108,6 @@
 -type state() :: #{'entry' => entry_fun() | [entry_fun()],
                    'exit' => exit_fun() | [exit_fun()],
                    'do' => do_fun() | [do_fun()],
-                   '_do' => do_fun(),
                    'pid' => pid(),
                    'entry_time' => timestamp(),
                    'exit_time' => timestamp(),
@@ -166,6 +166,8 @@
 
 %%-- actors
 -type actor_type() :: 'stem' | 'actor' | 'fsm' | 'thing'.
+-type template() :: actor_type() | module() |
+                    [actor_type() | map()] | function().
 
 
 %%- MACROS
@@ -195,34 +197,54 @@ start(State) ->
 
 
 %%!future: merge create function into entry to unify state object factory.
--spec create(actor_type()) -> state().
-create(Type) ->
-    create(Type, #{}).
+-spec create(template()) -> state().
+create(Template) ->
+    create(Template, #{}).
 
--spec create(actor_type() | module(), map()) -> state().
+-spec create(template(), map()) -> state().
 %% stem: state().
 create(stem, Data) ->
     Data;
-%% fsm: stem, $start, $state, $fsm, states, step, max_steps, sign, payload.
+%% fsm: stem, start, $state, $fsm, states, step, max_steps, sign, payload.
 create(fsm, Data) ->
-    chain_action(Data, do, fun fsm_do/2);
+    enable(Data, [subscribe, fsm]);
 %% actor: stem, subscribers, _subscribers, links, monitors, _monitors,
 %% report_items, surname, parent.
 create(actor, Data) ->
-    Actor = #{subscribers => fun subscribers/3,
-              monitors => fun monitors/3,
-              do => [fun links_do/2, fun monitors_do/2, fun subscribers_do/2],
-              exit => fun actor_exit/1
-             },
-    merge(Actor, Data);
+    enable(Data, [link, subscribe, monitor]);
 %% thing: stem, fsm, actor.
 create(thing, Data) ->
-    Actor = create(actor, Data),
-    chain_action(Actor, do, fun fsm_do/2);
+    enable(Data, [link, subscribe, monitor, fsm]);
+create(Module, Data) when is_atom(Module) ->
+    from_module(Module, Data);
+create(Template, Data) when is_list(Template) ->
+    enable(Data, Template);
 create(Forge, Data) when is_function(Forge) ->
-    Forge(Data);
-create(Module, Data) ->
-    from_module(Module, Data).
+    Forge(Data).
+
+enable(Data, []) ->
+    Data;
+enable(Data, [link | Rest]) ->
+    D = chain_action(Data, do, fun links_do/2),
+    enable(D, Rest);
+enable(Data, [fsm | Rest]) ->
+    D = chain_action(Data, do, fun fsm_do/2),
+    enable(D, Rest);
+enable(Data, [subscribe | Rest]) ->
+    Sub = maps:get(subscribers, Data, fun subscribers/3),
+    D1 = Data#{subscribers => Sub},
+    D2 = chain_action(D1, do, fun subscribers_do/2),
+    D3 = chain_action(D2, exit, fun subscribers_exit/1),
+    enable(D3, Rest);
+enable(Data, [monitor | Rest]) ->
+    Sub = maps:get(monitors, Data, fun monitors/3),
+    D1 = Data#{monitors => Sub},
+    D2 = chain_action(D1, do, fun monitors_do/2),
+    D3 = chain_action(D2, exit, fun monitors_exit/1),
+    enable(D3, Rest);
+enable(Data, [Template | Rest]) ->
+    D = merge(Template, Data),
+    enable(D, Rest).
 
 
 -spec from_module(module(), map()) -> state().
@@ -231,24 +253,13 @@ from_module(Module, Data) ->
         true ->
             Module:create(Data);
         _ ->
-            A1 = case erlang:function_exported(Module, entry, 1) of
-                     true->
-                         chain_action(Data, entry, fun Module:entry/1);
-                     false ->
-                         Data
-                 end,
-            A2 = case erlang:function_exported(Module, do, 2) of
-                     true->
-                         chain_action(A1, do, fun Module:do/2);
-                     false ->
-                         A1
-                 end,
-            case erlang:function_exported(Module, exit, 1) of
-                true->
-                    chain_action(A2, exit, fun Module:exit/1);
-                false ->
-                    A2
-            end
+            Attributes = Module:module_info(attributes),
+            Functions = Module:module_info(exports),
+            D0 = maps:from_list(Attributes),
+            D1 = lists:foldl(fun({F, A}, D) ->
+                                    D#{F => fun Module:F/A}
+                             end, D0, Functions),
+            merge(D1, Data)
     end.
 
 
@@ -387,11 +398,11 @@ code_change(_OldVsn, State, _Extra) ->
 %%------------------------------------------------------------------------------
 -spec call(target(), command()) -> reply().
 call([Process | Path], Command) ->
-    call(Process, Path, Command, ?DFL_TIMEOUT);
+    call(Process, Path, Command, infinity);
 call({Process, Path}, Command) ->
-    call(Process, Path, Command, ?DFL_TIMEOUT);
+    call(Process, Path, Command, infinity);
 call(Process, Command) ->
-    call(Process, [], Command, ?DFL_TIMEOUT).
+    call(Process, [], Command, infinity).
 
 -spec call(target(), command(), timeout()) -> reply().
 call([Process | Path], Command, Timeout) ->
@@ -575,9 +586,9 @@ chain_action(State, Name, Action, Position) ->
         error ->
             State#{Name => Action};
         {ok, L} when Position =:= head ->
-            State#{Name := chain(L, Action)};
+            State#{Name := chain(Action, L)};
         {ok, L} when Position =:= tail ->
-            State#{Name := chain(Action, L)}
+            State#{Name := chain(L, Action)}
     end.
 
 
@@ -688,9 +699,9 @@ do_callbacks({F, A}, {R, S, L}) ->
             exit(Reason)
     end.
 
-handle_break(Break, #{critical_links := all} = State) ->
+handle_break(Break, #{bonds := all} = State) ->
     {stop, {shutdown, Break}, State};
-handle_break({_, Pid, _} = Break, #{critical_links := Cl} = State) ->
+handle_break({_, Pid, _} = Break, #{bonds := Cl} = State) ->
     case sets:is_element(Pid, Cl) of
         true ->
             {stop, {shutdown, Break}, State};
@@ -719,7 +730,7 @@ response(_, Caller, {stop, Reason, Reply, NewState}) ->
 
 %% Invoke on root of actor.
 request(Command, [], _, State) ->
-    root_do(Command, State);
+    do_(Command, State);
 %% Branches and sprig.
 request(Command, To, From, State) ->
     case access(Command, To, State) of
@@ -732,16 +743,6 @@ request(Command, To, From, State) ->
         {actor, Pid, Sprig} ->
             {refer, {Pid, Sprig}, State}
     end.
-
-root_do(Command, #{'_do' := R} = State) when is_function(R, 2) ->
-    case R(Command, State) of
-        {unhandled, S} ->
-            do_(Command, S);
-        Result ->
-            Result
-    end;
-root_do(Command, State) ->
-    do_(Command, State).
 
 do_(stop, State) ->
     {stop, normal, State};
@@ -1001,12 +1002,13 @@ remove_bond(_, State) ->
 
 %%- Actor behaviors.
 %%------------------------------------------------------------------------------
-%%-- Subscription & notification.
+
+%%-- Behaviors of subscribe & notification.
+%%------------------------------------------------------------------------------
 %% Introduced:
 %%  * 'subscribers': active attribute for subscription actions.
 %%  * '_subscribers': subscribers data cache.
 %%  * 'report_items': definition of output items when actor exit.
--spec subscribers(command(), target(), state()) -> result().
 subscribers({new, Pid}, [], State) ->
     Subs = maps:get('_subscribers', State, #{}),
     Mref = monitor(process, Pid),
@@ -1030,8 +1032,34 @@ subscribers(delete, Mref, State) ->
 subscribers(_, _, State) ->
     {{error, badarg}, State}.
 
+subscribers_do({'DOWN', M, _, _, _}, State) ->
+    case maps:find('_subscribers', State) of
+        {ok, Subs} ->
+            Subs1 = maps:remove(M, Subs),
+            {noreply, State#{'_subscribers' := Subs1}};
+        error ->
+            {unhandled, State}
+    end;
+subscribers_do(_, State) ->
+    {unhandled, State}.
 
--spec monitors(command(), path(), state()) -> result().
+subscribers_exit(State) ->
+    Detail = maps:get('report_items', State, []),
+    Report = make_report(Detail, State),
+    Info = {exit, Report},
+    {_, S} = invoke({notify, Info, remove}, [subscribers], State),
+    S.
+
+%% Selective report.
+make_report(all, State) ->
+    State;
+%% Selections is a list of attributes to yield.
+make_report(Selections, State) when is_list(Selections) ->
+    maps:with(Selections, State).
+
+
+%%-- Behaviors of monitor.
+%%------------------------------------------------------------------------------
 monitors(get, [Id], #{'_monitors' := M} = State) ->
     case maps:find(Id, M) of
         error ->
@@ -1085,6 +1113,22 @@ monitors({'DOWN', _, _, _, _}, [], State) ->
 monitors(_, _, State) ->
     {{error, badarg}, State}.
 
+monitors_do({'$$', _, Key, delete}, State) ->
+    case invoke(delete, [monitors, Key], State) of
+        {_, S} ->
+            {unhandled, S};
+        Stop ->
+            Stop
+    end;
+monitors_do({'DOWN', _, _, _, _} = Down, State) ->
+    invoke(Down, [monitors], State);
+monitors_do(_, State) ->
+    {unhandled, State}.
+
+monitors_exit(State) ->
+    {_, S} = invoke({delete, all}, [monitors], State),
+    S.
+
 new_monitor({Key, Pid, Bond}, M) when is_pid(Pid) ->
     Mref = monitor(process, Pid),
     V = {Mref, Key, Bond},
@@ -1096,7 +1140,8 @@ new_monitor({K, V}, M) ->
     new_monitor({K, V, false}, M).
 
 
--spec links_do(message(), state()) -> result().
+%%-- Behaviors of link.
+%%------------------------------------------------------------------------------
 links_do({'$$', _, [links | _], _}, State) ->
     {unhandled, State};
 links_do({'$$', _, _, delete}, State) ->
@@ -1129,51 +1174,7 @@ links_do(_, State) ->
     {unhandled, State}.
 
 
--spec monitors_do(message(), state()) -> result().
-monitors_do({'$$', _, Key, delete}, State) ->
-    case invoke(delete, [monitors, Key], State) of
-        {_, S} ->
-            {unhandled, S};
-        Stop ->
-            Stop
-    end;
-monitors_do({'DOWN', _, _, _, _} = Down, State) ->
-    invoke(Down, [monitors], State);
-monitors_do(_, State) ->
-    {unhandled, State}.
-
-
--spec subscribers_do(message(), state()) -> result().
-subscribers_do({'DOWN', M, _, _, _}, State) ->
-    case maps:find('_subscribers', State) of
-        {ok, Subs} ->
-            Subs1 = maps:remove(M, Subs),
-            {noreply, State#{'_subscribers' := Subs1}};
-        error ->
-            {unhandled, State}
-    end;
-subscribers_do(_, State) ->
-    {unhandled, State}.
-
-
-%% Goodbye, subscribers! And submit leave report.
-actor_exit(State) ->
-    Detail = maps:get('report_items', State, []),
-    Report = make_report(Detail, State),
-    Info = {exit, Report},
-    {_, S} = invoke({notify, Info, remove}, [subscribers], State),
-    {_, S1} = invoke({delete, all}, [monitors], S),
-    S1.
-
-%% Selective report.
-make_report(all, State) ->
-    State;
-%% Selections is a list of attributes to yield.
-make_report(Selections, State) when is_list(Selections) ->
-    maps:with(Selections, State).
-
-
-%%- Finite State Machine behaviors.
+%%-- Behaviors of Finite State Machine.
 %%------------------------------------------------------------------------------
 -spec swap(state()) -> state().
 swap(#{'$state' := S} = Fsm) ->
@@ -1184,19 +1185,33 @@ swap(#{'$fsm' := F} = State) ->
 
 %% If $state is present before FSM start, it is an introducer for flexible
 %% initialization.
+fsm_do({'$$', _, [links | _], _}, Fsm) ->
+    {unhandled, Fsm};
+fsm_do({'$$', _, [subscribers | _], _}, Fsm) ->
+    {unhandled, Fsm};
+fsm_do({'$$', _, [monitors | _], _}, Fsm) ->
+    {unhandled, Fsm};
 fsm_do(Info, #{'$state' := _} = Fsm) ->
     do_state(Info, swap(Fsm));
-fsm_do('$$enter', #{'$start' := Start} = Fsm) ->
-    transition(Start, Fsm);
+fsm_do('$$enter', Fsm) ->
+    start_fsm(Fsm);
 fsm_do(_, Fsm) ->
     {unhandled, Fsm}.
 
+start_fsm(#{start := Start} = Fsm) when is_function(Start) ->
+    Start(Fsm);
+start_fsm(#{start := Start} = Fsm) ->
+    transition(Start, Fsm);
+start_fsm(Fsm) ->
+    {unhandled, Fsm}.
 
 %%!todo: archive historic states as traces.
 %%        {_, F1} = invoke({new, Fsm}, [traces], Fsm),            
 transition(Sign, Fsm) ->
     Step = maps:get(step, Fsm, 0),
     F1 = Fsm#{step => Step + 1},
+    %% Asynchronously notify.
+    cast([self(), subscribers], {notify, {transition, Step, Sign}}),
     %% states should handle exceptions. For examples: vertex of sign is not
     %% found or exceed max steps limited.
     case invoke(get, [states, Sign], F1) of
@@ -1231,6 +1246,9 @@ do_state(Info, State) ->
         {stop, Shutdown, S} ->
             {stop, Shutdown, swap(S)}
     catch
+        error : function_clause when element(1, Info) =:= '$$' ->
+            reply(element(2, Info), {error, unknown}),
+            {noreply, swap(State)};
         C : E ->
             Fsm = swap(State),
             transition(exception, Fsm#{payload => {C, E}})
