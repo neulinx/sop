@@ -1,7 +1,14 @@
 CHANGELOG
 =========
 
-2.8.0, finite state machine, unit test passed.
+v2.9.0, change internal name of attribute `links` to `props`.
+-------------------------------------------------------------
+
+- Change 'stem' template name to 'prop'.
+- Simplify logic of `props_do`.
+- Remove priority of `props` access in FSM.
+
+v2.8.0, finite state machine, unit test passed.
 ----------------------------------------------
 
 - Fix bug of bonds.

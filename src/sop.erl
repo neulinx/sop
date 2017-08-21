@@ -166,7 +166,7 @@
 
 %%-- actors
 -type actor_type() :: 'stem' | 'actor' | 'fsm' | 'thing'.
--type template() :: actor_type() | module() |
+-type template() :: actor_type() | module() | map() |
                     [actor_type() | map()] | function().
 
 
@@ -203,29 +203,31 @@ create(Template) ->
 
 -spec create(template(), map()) -> state().
 %% stem: state().
-create(stem, Data) ->
-    Data;
+create(prop, Data) ->
+    enable(Data, [prop]);
 %% fsm: stem, start, $state, $fsm, states, step, max_steps, sign, payload.
 create(fsm, Data) ->
-    enable(Data, [subscribe, fsm]);
-%% actor: stem, subscribers, _subscribers, links, monitors, _monitors,
+    enable(Data, [subscribe, fsm, prop]);
+%% actor: stem, subscribers, _subscribers, props, monitors, _monitors,
 %% report_items, surname, parent.
 create(actor, Data) ->
-    enable(Data, [link, subscribe, monitor]);
+    enable(Data, [subscribe, monitor, prop]);
 %% thing: stem, fsm, actor.
 create(thing, Data) ->
-    enable(Data, [link, subscribe, monitor, fsm]);
+    enable(Data, [subscribe, monitor, fsm, prop]);
 create(Module, Data) when is_atom(Module) ->
     from_module(Module, Data);
 create(Template, Data) when is_list(Template) ->
     enable(Data, Template);
+create(Template, Data) when is_map(Template) ->
+    merge(Template, Data);
 create(Forge, Data) when is_function(Forge) ->
     Forge(Data).
 
 enable(Data, []) ->
     Data;
-enable(Data, [link | Rest]) ->
-    D = chain_action(Data, do, fun links_do/2),
+enable(Data, [prop | Rest]) ->
+    D = chain_action(Data, do, fun props_do/2),
     enable(D, Rest);
 enable(Data, [fsm | Rest]) ->
     D = chain_action(Data, do, fun fsm_do/2),
@@ -756,7 +758,7 @@ do_(Command, State) ->
         {update, Reply, NewS} when (not is_tuple(Command));
                                    element(1, Command) =/= put ->
             {Reply, NewS};
-        _ ->
+        _ -> %{delete, ok} 
             {{error, badarg}, State}
     end.
 
@@ -914,7 +916,7 @@ chain_callback(Tag, Callback, Position, State) ->
 
 -spec attach(tag(), state()) -> result().
 attach(Key, State) ->
-    Path = chain(links, Key),
+    Path = chain(props, Key),
     case invoke(get, Path, State) of
         {{error, _}, _} = Error ->
             Error;
@@ -1140,37 +1142,19 @@ new_monitor({K, V}, M) ->
     new_monitor({K, V, false}, M).
 
 
-%%-- Behaviors of link.
+%%-- Behaviors of properties.
 %%------------------------------------------------------------------------------
-links_do({'$$', _, [links | _], _}, State) ->
+props_do({'$$', _, [props | _], _}, State) ->
     {unhandled, State};
-links_do({'$$', _, _, delete}, State) ->
-    {unhandled, State};
-links_do({'$$', From, [Key | _] = Path, Command}, #{links := L} = State) ->
+props_do({'$$', From, [Key | _] = Path, Command}, State) ->
     %%!todo: optimize repeat fetching of Key.
     case maps:is_key(Key, State) of
         true ->
             {unhandled, State};
-        false when is_map(L) ->
-            case maps:find(Key, L) of
-                error ->
-                    reply(From, {error, undefined}),
-                    {noreply, State};
-                {ok, Value} ->
-                    case attach(Key, Value, State) of
-                        {ok, S} ->
-                            {unhandled, S};
-                        {Error, S} ->
-                            reply(From, Error),
-                            {noreply, S};
-                        Stop ->
-                            Stop
-                    end
-            end;
         false ->
-            refer(From, [links | Path], Command, State)
+            refer(From, [props | Path], Command, State)
     end;
-links_do(_, State) ->
+props_do(_, State) ->
     {unhandled, State}.
 
 
@@ -1184,9 +1168,9 @@ swap(#{'$fsm' := F} = State) ->
 
 
 %% If $state is present before FSM start, it is an introducer for flexible
-%% initialization.
-fsm_do({'$$', _, [links | _], _}, Fsm) ->
-    {unhandled, Fsm};
+%% initialization. Behaviors of subscribe and monitor are global attributes.
+fsm_do({'$$', From, ['$fsm' | Path], Command}, Fsm) ->
+    handle({'$$', From, Path, Command}, Fsm);
 fsm_do({'$$', _, [subscribers | _], _}, Fsm) ->
     {unhandled, Fsm};
 fsm_do({'$$', _, [monitors | _], _}, Fsm) ->
