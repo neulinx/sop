@@ -67,7 +67,6 @@
 -export([chain/2,
          chain_action/3, chain_action/4,
          chain_actions/3,
-         chain_callback/4,
          merge/2
         ]).
 %% Internal process.
@@ -349,14 +348,19 @@ handle_cast(Method, State) ->
 %%     {noreply, NewState :: term(), timeout() | hibernate} |
 %%     {stop, Reason :: term(), NewState :: term()}.
 handle_info(Info, State) ->
-    case chain_react(do, Info, State) of
+    try chain_react(do, Info, State) of
         {unhandled, S} ->
             handle(Info, S);
         {refer, NextHop, S} ->
             catch NextHop ! Info,
             {noreply, S};
-        Result ->
-            Result
+        {_, S} ->
+            {noreply, S};
+        Stop ->
+            Stop
+    catch
+        exit: {stop, Reason, FinalState} ->
+            {stop, Reason, FinalState}
     end.
 
 
@@ -664,42 +668,23 @@ handle(_, State) ->
 handle_result(Ref, Result, #{pending_calls := Q} = State) ->
     %% Timeout control of asynchnous call may be implemented by send_after
     %% function.
-    case maps:take(Ref, Q) of
-        {{Func, Arg}, Q1} ->
+    case maps:find(Ref, Q) of
+        {ok, {Func, Arg}} ->
             case Func(Result, Arg, State) of
-                {done, State1} ->
+                {done, #{pending_calls := Q1} = State1} ->
                     catch demonitor(Ref),
-                    {noreply, State1#{pending_calls := Q1}};
+                    Q2 = maps:remove(Ref, Q1),
+                    {noreply, State1#{pending_calls := Q2}};
                 {pending, State1} ->
                     {noreply, State1};
                 Stop -> % should be stop result.
                     Stop
-            end;
-        {Callbacks, Q1} when is_list(Callbacks) ->
-            case lists:foldr(fun do_callbacks/2,
-                             {Result, State, []}, Callbacks) of
-                {_, State1, []} ->
-                    catch demonitor(Ref),
-                    {noreply, State1#{pending_calls := Q1}};
-                {_, State1, Rest} ->
-                    Q2 = Q#{Ref := Rest},
-                    {noreply, State1#{pending_calls := Q2}}
             end;
         _ ->  % do nothing and keep State untouched.
             {noreply, State}
     end;
 handle_result(_, _, State) ->
     {noreply, State}.
-
-do_callbacks({F, A}, {R, S, L}) ->
-    case F(R, A, S) of
-        {done, S1} ->
-            {R, S1, L};
-        {pending, S1} ->
-            {R, S1, [{F, A} | L]};
-        {stop, Reason, _} ->
-            exit(Reason)
-    end.
 
 handle_break(Break, #{bonds := all} = State) ->
     {stop, {shutdown, Break}, State};
@@ -723,8 +708,7 @@ response(Command, Caller, {refer, Target, NewState}) ->
     refer(Caller, Target, Command, NewState);
 response(_, Caller, {refer, Target, Command, NewState}) ->
     refer(Caller, Target, Command, NewState);
-response(_, Caller, {stop, Reason, NewState}) ->
-    reply(Caller, stopping),
+response(_, _, {stop, Reason, NewState}) ->
     {stop, Reason, NewState};
 response(_, Caller, {stop, Reason, Reply, NewState}) ->
     reply(Caller, Reply),
@@ -747,9 +731,9 @@ request(Command, To, From, State) ->
     end.
 
 do_(stop, State) ->
-    {stop, normal, State};
+    {stop, normal, ok, State};
 do_({stop, Reason},  State) ->
-    {stop, Reason, State};
+    {stop, {shutdown, Reason}, ok, State};
 do_(Command, State) ->
     %% Support: get, {get, Selection}, {patch, Value}, {new, Value}
     case access(Command, [], State) of
@@ -849,6 +833,7 @@ refer(Caller, Process, Command, State) ->
 
 
 %%- Internal state operation.
+%%! Internal invocation without calling 'do' action.
 -spec invoke(command(), target(), state()) -> result().
 invoke(Command, Path, State) ->
     case access(Command, Path, State) of
@@ -872,7 +857,7 @@ invoke(Command, Path, State) ->
             end;
         {actor, Pid, Sprig} ->
             state_call({Pid, Sprig}, Command, State);
-        {delete, ok} ->
+        _ ->
             {{error, badarg}, State}
     end.
 
@@ -908,11 +893,6 @@ enqueue_callback(Tag, Callback, State) ->
     Q1 = Q#{Tag => Callback},
     State#{pending_calls => Q1}.
 
--spec chain_callback(tag(), callback(), position(), state()) -> state().
-chain_callback(Tag, Callback, Position, State) ->
-    Q = maps:get(pending_calls, State, #{}),
-    Q1 = chain_action(Q, Tag, [Callback], Position),
-    State#{pending_calls => Q1}.
 
 -spec attach(tag(), state()) -> result().
 attach(Key, State) ->

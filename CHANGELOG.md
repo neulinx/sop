@@ -1,6 +1,18 @@
 CHANGELOG
 =========
 
+v2.10.0, asynchronous callback and quit process anywhere.
+---------------------------------------------------------
+
+- To quit process with updated state by call `exit({stop, Reason, State})`,
+  which simplify the result process by ignore case of stop.
+- Fix a minor bug of duplicated reply when invoke stop command.
+- External reason of quit (by external command or link break) is format of
+  `{shutdown, Reason}`.
+- Simplify the asynchronous callback without chain call support.
+- Fix bug of overlapped "asyn_call".
+
+
 v2.9.0, change internal name of attribute `links` to `props`.
 -------------------------------------------------------------
 
