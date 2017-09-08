@@ -1,11 +1,18 @@
-%%%-------------------------------------------------------------------
+%%%-----------------------------------------------------------------------------
 %%% @author Gary Hai <gary@XL59.com>
 %%% @copyright (C) 2017, Neulinx Inc.
 %%% @doc
-%%%
+%%%  * Function should be returned instantly. Time-consuming operations should
+%%%    be scheduled to run in a separate process.
+%%%  * Internal path parameter is different from external. When the path is list
+%%%    type, it is always equal to [self() | Path] as external usage.
+%%%  * Args of callback function is copied between process, so keep it small.
+%%%  * It is recommended to use the erlang:exit/1 function to quit process.
+%%%  * If you don't want caller to touch your actor state by callback, you
+%%%    should always call reply/2 instead of reply/3 to response.
 %%% @end
 %%% Created : 24 May 2017 by Gary Hai <gary@XL59.com>
-%%%-------------------------------------------------------------------
+%%%-----------------------------------------------------------------------------
 -module(sop).
 
 -compile({no_auto_import, [get/1, put/2]}).
@@ -34,10 +41,9 @@
 
 %%-- Message helpers.
 %% Generic.
--export([call/2, call/3,
-         cast/2,
-         reply/2,
-         relay/3, relay/4
+-export([call/2, call/3, call/4,
+         cast/2, cast/3, cast/4, cast/5,
+         reply/2, reply/3
         ]).
 
 %% Operations.
@@ -71,11 +77,8 @@
         ]).
 %% Internal process.
 -export([handle/2,
-         state_call/3,
-         asyn_call/4,
-         asyn_call/5,
          refer/4,
-         invoke/3,
+         invoke/3, invoke/4,
          attach/2, attach/3,
          detach/2,
          bind/2,
@@ -111,8 +114,8 @@
                    'entry_time' => timestamp(),
                    'exit_time' => timestamp(),
                    'status' => status(),
+                   'reason' => any(),
                    'timeout' => timeout(),
-                   'pending_calls' => #{reference() => callback()},
                    'bonds' => 'all' | sets:sets(),
                    'start_options' => start_opt(),
                    'register_name' => server_name(),
@@ -138,8 +141,13 @@
 -type stop() :: {'stop', Reason :: any(), state()} |
                 {'stop', Reason :: any(), reply(), state()}.
 -type result() :: {reply(), state()} | refer() | stop().
--type cb_func() :: fun((reply(), Args :: any(), state()) -> state()).
--type callback() :: {cb_func(), Args :: any()}.
+-type args() :: any().
+%% Callback function return new state or return the state paramenter
+%% untouched. The callback function have the responsibility to handle timeout
+%% exceptions.
+-type cb_func() :: fun((reply(), args(), state() | 'undefined') ->
+                              state() | 'undefined').
+-type callback() :: {cb_func(), args()}.
 -type position() :: 'head' | 'tail' | integer().
 
 %%-- Messages.
@@ -148,11 +156,12 @@
                    {'$$', from(), target(), command()} |
                    any().
 -type path() :: list().
--type from() :: {pid(), reference()} | 'call' | 'cast'.
+-type from() :: {pid(), reference()} | 
+                {pid(), {'$callback', cb_func(), args()}} |
+                callback() | 'call' | 'cast'.
 -type command() :: method() |
-                   {method(), any()} |
-                   {method(), any(), any()} |
-                   any().
+                   {method(), args()} |
+                   {method(), args(), Options :: any()}.
 -type method() :: 'get' |
                   'put' |
                   'patch' |
@@ -437,39 +446,54 @@ call(Process, Path, Command, Timeout) ->
 
 
 -spec cast(target(), command()) -> 'ok'.
-cast([Process | Path], Command) ->
-    cast(Process, Path, Command);
-cast({Process, Path}, Command) ->
-    cast(Process, Path, Command);
-cast(Process, Command) ->
-    cast(Process, [], Command).
+cast(Target, Command) ->
+    cast(Target, Command, cast, local).
 
--spec cast(process(), path(), Message :: any()) -> 'ok'.
-cast(Process, Path, Message) ->
-    catch Process ! {'$$', cast, Path, Message},
+-spec cast(target(), command(), from()) -> 'ok'.
+cast(Target, Command, Acceptor) ->
+    cast(Target, Command, Acceptor, local).
+
+%% When Mode is 'local', CbFunc is called in caller process. To invoke the
+%% callback function in the last branch process of the path, you may set Mode to
+%% 'roaming'.
+-spec cast(target(), command(), from(), Mode) -> 'ok' when
+      Mode :: 'local' | 'roaming'.
+cast([Process | Path], Command, Acceptor, Mode) ->
+    cast(Process, Path, Command, Acceptor, Mode);
+cast({Process, Path}, Command, Acceptor, Mode) ->
+    cast(Process, Path, Command, Acceptor, Mode);
+cast(Process, Command, Acceptor, Mode) ->
+    cast(Process, [], Command, Acceptor, Mode).
+
+cast(Process, Path, Command, {F, A}, local) when is_function(F) ->
+    Acceptor = {self(), {'$callback', F, A}},
+    catch Process ! {'$$', Acceptor, Path, Command},
+    ok;
+cast(Process, Path, Command, Acceptor, _) ->
+    catch Process ! {'$$', Acceptor, Path, Command},
     ok.
 
 
--spec reply({tag(), reference()}, Reply :: any()) -> 'ok'.
-reply({To, Tag}, Reply) ->
-    catch To ! {Tag, Reply},
+-spec reply(from(), reply()) -> 'ok'.
+%% If Promise is callback type, callback function schedule to caller process.
+reply({To, Promise}, Reply) when is_pid(To)->
+    catch To ! {Promise, Reply},
+    ok;
+%% Callback function may be invoked in the last hop process.
+reply({Callback, Args}, Reply) when is_function(Callback)->
+    Callback(Reply, Args, undefined),
     ok;
 reply(_, _) ->
     ok.
 
-
--spec relay(from(), target(), command()) -> 'ok'.
-relay(From, [To | Path], Command) ->
-    relay(From, To, Path, Command);
-relay(From, {To, Path}, Command) ->
-    relay(From, To, Path, Command);
-relay(From, To, Command) ->
-    relay(From, To, [], Command).
-
--spec relay(from(), process(), path(), command()) -> 'ok'.
-relay(From, To, Path, Command) ->
-    catch To ! {'$$', From, Path, Command},
-    ok.
+-spec reply(from(), reply(), state()) -> state().
+reply({To, Tag}, Reply, State) when is_pid(To) ->
+    catch To ! {Tag, Reply},
+    State;
+reply({Func, Args}, Reply, State) when is_function(Func) ->
+    Func(Reply, Args, State);
+reply(_, _, State) ->
+    State.
 
 
 %%-- Data access.
@@ -655,36 +679,14 @@ handle({'$$', From, Command}, State) ->
     response(Command, From, request(Command, [], From, State));
 handle({'$$', Command}, State) ->
     response(Command, cast, request(Command, [], cast, State));
-handle({Ref, Result}, State) ->
-    handle_result(Ref, Result, State);
-handle({'DOWN', M, _, _, Reason}, State) ->
-    handle_result(M, {error, Reason}, State);
+handle({{'$callback', Func, Args}, Result}, State) ->
+    {noreply, Func(Result, Args, State)};
 handle({'EXIT', _, _} = Break, State) ->
     handle_break(Break, State);
 %% Drop unknown messages. Nothing replied.
 handle(_, State) ->
     {noreply, State}.
 
-handle_result(Ref, Result, #{pending_calls := Q} = State) ->
-    %% Timeout control of asynchnous call may be implemented by send_after
-    %% function.
-    case maps:find(Ref, Q) of
-        {ok, {Func, Arg}} ->
-            case Func(Result, Arg, State) of
-                {done, #{pending_calls := Q1} = State1} ->
-                    catch demonitor(Ref),
-                    Q2 = maps:remove(Ref, Q1),
-                    {noreply, State1#{pending_calls := Q2}};
-                {pending, State1} ->
-                    {noreply, State1};
-                Stop -> % should be stop result.
-                    Stop
-            end;
-        _ ->  % do nothing and keep State untouched.
-            {noreply, State}
-    end;
-handle_result(_, _, State) ->
-    {noreply, State}.
 
 handle_break(Break, #{bonds := all} = State) ->
     {stop, {shutdown, Break}, State};
@@ -702,8 +704,7 @@ handle_break(_, State) ->
 response(_, _, {noreply, NewState}) ->
     {noreply, NewState};
 response(_, Caller, {Reply, NewState}) ->
-    reply(Caller, Reply),
-    {noreply, NewState};
+    {noreply, reply(Caller, Reply, NewState)};
 response(Command, Caller, {refer, Target, NewState}) ->
     refer(Caller, Target, Command, NewState);
 response(_, Caller, {refer, Target, Command, NewState}) ->
@@ -711,8 +712,8 @@ response(_, Caller, {refer, Target, Command, NewState}) ->
 response(_, _, {stop, Reason, NewState}) ->
     {stop, Reason, NewState};
 response(_, Caller, {stop, Reason, Reply, NewState}) ->
-    reply(Caller, Reply),
-    {stop, Reason, NewState}.
+    S = reply(Caller, Reply, NewState),
+    {stop, Reason, S}.
 
 %% Invoke on root of actor.
 request(Command, [], _, State) ->
@@ -834,7 +835,12 @@ refer(Caller, Process, Command, State) ->
 
 %%- Internal state operation.
 %%! Internal invocation without calling 'do' action.
+%% Synchronous version of invoke function without callback.
 -spec invoke(command(), target(), state()) -> result().
+invoke(Command, {Proc, Path}, State) ->
+    Timeout = maps:get(timeout, State, ?DFL_TIMEOUT),
+    Result = call(Proc, Path, Command, Timeout),
+    {Result, State};
 invoke(Command, Path, State) ->
     case access(Command, Path, State) of
         {result, Res} ->
@@ -842,56 +848,41 @@ invoke(Command, Path, State) ->
         {update, Reply, NewState} ->
             {Reply, NewState};
         {action, Func, Route} ->
-            %% Caller is call means neither aynchronous return nor forwarding.
             case perform(Func, Command, Route, call, State) of
-                {refer, Next, S} when is_list(Next) ->
-                    invoke(Command, Next, S);
                 {refer, Next, S} ->
-                    state_call(Next, Command, S);
-                {refer, Next, NewCmd, S} when is_list(Next) ->
-                    invoke(NewCmd, Next, S);
+                    invoke(Command, Next, S);
                 {refer, Next, NewCmd, S} ->
-                    state_call(Next, NewCmd, S);
+                    invoke(NewCmd, Next, S);
                 Result ->
                     Result
             end;
         {actor, Pid, Sprig} ->
-            state_call({Pid, Sprig}, Command, State);
+            invoke(Command, {Pid, Sprig}, State);
         _ ->
             {{error, badarg}, State}
     end.
 
-
--spec state_call(target(), command(), state()) -> {Result :: any(), state()}.
-state_call(Target, Command, State) ->
-    Timeout = maps:get(timeout, State, ?DFL_TIMEOUT),
-    Result = call(Target, Command, Timeout),
-    {Result, State}.
-
-
--spec asyn_call(target(), command(), callback(), state()) ->
-                        {Result :: any(), state()}.
-asyn_call([Process | Path], Command, Callback, State) ->
-    asyn_call(Process, Path, Command, Callback, State);
-asyn_call({Process, Path}, Command, Callback, State) ->
-    asyn_call(Process, Path, Command, Callback, State);
-asyn_call(Process, Command, Callback, State) ->
-    asyn_call(Process, [], Command, Callback, State).
-
-
--spec asyn_call(process(), path(), command(), callback(), state()) -> reply().
-asyn_call(Process, Path, Command, Callback, State) ->
-    Tag = monitor(process, Process),
-    Process ! {'$$', {self(), Tag}, Path, Command},
-    S = enqueue_callback(Tag, Callback, State),
-    {Tag, S}.
-
-
--spec enqueue_callback(tag(), callback(), state()) -> state().
-enqueue_callback(Tag, Callback, State) ->
-    Q = maps:get(pending_calls, State, #{}),
-    Q1 = Q#{Tag => Callback},
-    State#{pending_calls => Q1}.
+%% Asynchoronous version invoke function with callback. For the sake of safety
+%% and clarity, callback function should be called in caller process.
+-spec invoke(command(), target(), from(), state()) -> result().
+invoke(Command, Path, Caller, State) when is_tuple(Path) ->
+    cast(Path, Command, Caller, local),
+    {noreply, State};
+invoke(Command, Path, Caller, State) ->
+    case access(Command, Path, State) of
+        {result, Res} ->
+            {noreply, reply(Caller, Res, State)};
+        {update, Reply, NewState} ->
+            {noreply, reply(Caller, Reply, NewState)};
+        {action, Act, Route} ->  % internal aysnchronous call.
+            Result = perform(Act, Command, Route, Caller, State),
+            response(Command, Caller, Result);
+        {actor, Pid, Sprig} -> % external asyn call: {self(), Callback}.
+            cast({Pid, Sprig}, Command, Caller, local),
+            {noreply, State};
+        _ ->
+            {{error, badarg}, State}
+    end.
 
 
 -spec attach(tag(), state()) -> result().
@@ -905,7 +896,6 @@ attach(Key, State) ->
         Stop ->
             Stop
     end.
-
 
 -spec attach(tag(), Value :: any(), state()) -> result().
 attach(Key, Pid, State) when is_pid(Pid) ->
@@ -1211,8 +1201,8 @@ do_state(Info, State) ->
             {stop, Shutdown, swap(S)}
     catch
         error : function_clause when element(1, Info) =:= '$$' ->
-            reply(element(2, Info), {error, unknown}),
-            {noreply, swap(State)};
+            S = reply(element(2, Info), {error, unknown}, State),
+            {noreply, swap(S)};
         C : E ->
             Fsm = swap(State),
             transition(exception, Fsm#{payload => {C, E}})

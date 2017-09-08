@@ -1,6 +1,27 @@
 CHANGELOG
 =========
 
+v2.12.1, re-export cast/4 and bump the version for new release.
+---------------------------------------------------------------
+
+- Export `fun cast/4`.
+
+v2.12.0, simplify the exported functions for asynchronous call.
+---------------------------------------------------------------
+
+- Merge 'relay' functions to 'cast' function.
+- Remove `asyn_call`, be replaced by 'cast'.
+- Change `invoke/5` to `invoke/4` and simplify it.
+
+v2.11.0, refactor the asynchronous call mechanism.
+-------------------------------------------------
+
+- Change behavior of asyn_call functions.
+- Change behavior of callback functions.
+- Improve reply functions to support async call.
+- Remove old fashion of asynchoronous call.
+- invoke functions have two version: sync and async.
+
 v2.10.0, asynchronous callback and quit process anywhere.
 ---------------------------------------------------------
 
