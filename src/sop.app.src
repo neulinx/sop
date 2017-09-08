@@ -1,0 +1,15 @@
+{application, sop,
+ [{description, "State-oriented programming framework."},
+  {vsn, "2.12.1"},
+  {registered, []},
+  {applications,
+   [kernel,
+    stdlib
+   ]},
+  {env,[]},
+  {modules, [sop]},
+
+  {maintainers, []},
+  {licenses, []},
+  {links, []}
+ ]}.
