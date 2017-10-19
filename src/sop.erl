@@ -77,9 +77,10 @@
         ]).
 %% Internal process.
 -export([handle/2,
-         refer/4,
          invoke/3, invoke/4,
-         attach/2, attach/3,
+         map_reduce/4,
+         localize/2,
+         attach/3,
          detach/2,
          bind/2,
          unbind/2,
@@ -140,7 +141,7 @@
                  {'refer', target(), command(), state()}. 
 -type stop() :: {'stop', Reason :: any(), state()} |
                 {'stop', Reason :: any(), reply(), state()}.
--type result() :: {reply(), state()} | refer() | stop().
+-type result() :: {reply(), state()} | refer() | stop() | state().
 -type args() :: any().
 %% Callback function return new state or return the state paramenter
 %% untouched. The callback function have the responsibility to handle timeout
@@ -156,7 +157,7 @@
                    {'$$', from(), target(), command()} |
                    any().
 -type path() :: list().
--type from() :: {pid(), reference()} | 
+-type from() :: {pid(), any()} | 
                 {pid(), {'$callback', cb_func(), args()}} |
                 callback() | 'call' | 'cast'.
 -type command() :: method() |
@@ -210,51 +211,58 @@ create(Template) ->
     create(Template, #{}).
 
 -spec create(template(), map()) -> state().
-%% stem: state().
-create(prop, Data) ->
-    enable(Data, [prop]);
-%% fsm: stem, start, $state, $fsm, states, step, max_steps, sign, payload.
-create(fsm, Data) ->
-    enable(Data, [subscribe, fsm, prop]);
-%% actor: stem, subscribers, _subscribers, props, monitors, _monitors,
-%% report_items, surname, parent.
-create(actor, Data) ->
-    enable(Data, [subscribe, monitor, prop]);
-%% thing: stem, fsm, actor.
-create(thing, Data) ->
-    enable(Data, [subscribe, monitor, fsm, prop]);
+create(Tpl, Data) when Tpl == prop orelse
+                       Tpl == fsm orelse
+                       Tpl == actor orelse
+                       Tpl == thing ->
+    enable([Tpl], Data);
 create(Module, Data) when is_atom(Module) ->
     from_module(Module, Data);
 create(Template, Data) when is_list(Template) ->
-    enable(Data, Template);
+    enable(Template, Data);
 create(Template, Data) when is_map(Template) ->
     merge(Template, Data);
 create(Forge, Data) when is_function(Forge) ->
     Forge(Data).
 
-enable(Data, []) ->
+%% prop: state with 'props' and 'props_do' actions.
+%% fsm: prop, start, $state, $fsm, states, step, max_steps, sign, payload.
+%% actor: prop, subscribers, _subscribers, props, monitors, _monitors,
+%% report_items, surname, parent.
+%% thing: prop, fsm, actor.
+enable([], Data) ->
     Data;
-enable(Data, [prop | Rest]) ->
-    D = chain_action(Data, do, fun props_do/2),
-    enable(D, Rest);
-enable(Data, [fsm | Rest]) ->
+enable([actor | Rest], Data) ->
+    enable([subscribe, monitor, prop | Rest], Data);
+enable([thing | Rest], Data) ->
+    enable([subscribe, monitor, fsm, prop | Rest], Data);
+enable([fsm | Rest], Data) ->
     D = chain_action(Data, do, fun fsm_do/2),
-    enable(D, Rest);
-enable(Data, [subscribe | Rest]) ->
+    enable(Rest, D);
+enable([subscribe | Rest], Data) ->
     Sub = maps:get(subscribers, Data, fun subscribers/3),
     D1 = Data#{subscribers => Sub},
     D2 = chain_action(D1, do, fun subscribers_do/2),
     D3 = chain_action(D2, exit, fun subscribers_exit/1),
-    enable(D3, Rest);
-enable(Data, [monitor | Rest]) ->
+    enable(Rest, D3);
+enable([monitor | Rest], Data) ->
     Sub = maps:get(monitors, Data, fun monitors/3),
     D1 = Data#{monitors => Sub},
     D2 = chain_action(D1, do, fun monitors_do/2),
     D3 = chain_action(D2, exit, fun monitors_exit/1),
-    enable(D3, Rest);
-enable(Data, [Template | Rest]) ->
+    enable(Rest, D3);
+enable([prop | Rest], Data) ->
+    D = chain_action(Data, do, fun props_do/2),
+    enable(Rest, D);
+%% enable(#{props := _} = Data, [prop | Rest]) ->
+%%     D = chain_action(Data, do, fun props_do/2),
+%%     enable(D, Rest);
+%% enable(Data, [prop | Rest]) ->
+%%     D = Data#{props => fun invoke/4},
+%%     enable(D, Rest);
+enable([Template | Rest], Data) when is_map(Template) ->
     D = merge(Template, Data),
-    enable(D, Rest).
+    enable(Rest, D).
 
 
 -spec from_module(module(), map()) -> state().
@@ -356,17 +364,28 @@ handle_cast(Method, State) ->
 %%     {noreply, NewState :: term()} |
 %%     {noreply, NewState :: term(), timeout() | hibernate} |
 %%     {stop, Reason :: term(), NewState :: term()}.
+%% 'stop' command is unconditional.
+handle_info({'$$', Caller, [], stop}, State) ->
+    S = reply(Caller, stopping, State),
+    {stop, normal, S};
+handle_info({'$$', Caller, [], {stop, Reason}}, State) ->
+    S = reply(Caller, stopping, State),
+    {stop, Reason, S};
 handle_info(Info, State) ->
     try chain_react(do, Info, State) of
         {unhandled, S} ->
-            handle(Info, S);
-        {refer, NextHop, S} ->
-            catch NextHop ! Info,
-            {noreply, S};
+            case handle(Info, S) of
+                S0 when is_map(S0) ->
+                    {noreply, S0};
+                Result ->
+                    Result
+            end;
         {_, S} ->
             {noreply, S};
-        Stop ->
-            Stop
+        {stop, _, _} = Stop ->
+            Stop;
+        S ->
+            {noreply, S}
     catch
         exit: {stop, Reason, FinalState} ->
             {stop, Reason, FinalState}
@@ -570,7 +589,7 @@ notify(Path, Info) ->
 
 -spec stop(target()) -> reply().
 stop(Path) ->
-    call(Path, stop).
+    call(Path, {stop, normal}).
 
 -spec stop(target(), Reason :: any()) -> reply().
 stop(Path, Reason) ->
@@ -674,13 +693,9 @@ on_event([], _, State) ->
 %%-- sop messages.
 -spec handle(command(), state()) -> result().
 handle({'$$', From, To, Command}, State) ->
-    response(Command, From, request(Command, To, From, State));
-handle({'$$', From, Command}, State) ->
-    response(Command, From, request(Command, [], From, State));
-handle({'$$', Command}, State) ->
-    response(Command, cast, request(Command, [], cast, State));
+    invoke(Command, To, From, State);
 handle({{'$callback', Func, Args}, Result}, State) ->
-    {noreply, Func(Result, Args, State)};
+    Func(Result, Args, State);
 handle({'EXIT', _, _} = Break, State) ->
     handle_break(Break, State);
 %% Drop unknown messages. Nothing replied.
@@ -699,53 +714,6 @@ handle_break({_, Pid, _} = Break, #{bonds := Cl} = State) ->
     end;
 handle_break(_, State) ->
     {noreply, State}.
-
-%%-- Reply and normalize result of request.
-response(_, _, {noreply, NewState}) ->
-    {noreply, NewState};
-response(_, Caller, {Reply, NewState}) ->
-    {noreply, reply(Caller, Reply, NewState)};
-response(Command, Caller, {refer, Target, NewState}) ->
-    refer(Caller, Target, Command, NewState);
-response(_, Caller, {refer, Target, Command, NewState}) ->
-    refer(Caller, Target, Command, NewState);
-response(_, _, {stop, Reason, NewState}) ->
-    {stop, Reason, NewState};
-response(_, Caller, {stop, Reason, Reply, NewState}) ->
-    S = reply(Caller, Reply, NewState),
-    {stop, Reason, S}.
-
-%% Invoke on root of actor.
-request(Command, [], _, State) ->
-    do_(Command, State);
-%% Branches and sprig.
-request(Command, To, From, State) ->
-    case access(Command, To, State) of
-        {result, Res} ->
-            {Res, State};
-        {update, Reply, NewState} ->
-            {Reply, NewState};
-        {action, Func, Route} ->
-            perform(Func, Command, Route, From, State);
-        {actor, Pid, Sprig} ->
-            {refer, {Pid, Sprig}, State}
-    end.
-
-do_(stop, State) ->
-    {stop, normal, ok, State};
-do_({stop, Reason},  State) ->
-    {stop, {shutdown, Reason}, ok, State};
-do_(Command, State) ->
-    %% Support: get, {get, Selection}, {patch, Value}, {new, Value}
-    case access(Command, [], State) of
-        {result, Res} ->
-            {Res, State};
-        {update, Reply, NewS} when (not is_tuple(Command));
-                                   element(1, Command) =/= put ->
-            {Reply, NewS};
-        _ -> %{delete, ok} 
-            {{error, badarg}, State}
-    end.
 
 
 %% get, delete and put with [Key] is handled by the parent attribute, not by the
@@ -822,21 +790,12 @@ perform(Func, _, _, _, State) ->
     Func(State).
 
 
--spec refer(from(), To :: target(), command(), state()) -> result().
-refer(Caller, Path, Command, State) when is_list(Path) ->
-    handle_info({'$$', Caller, Path, Command}, State);
-refer(Caller, {Process, Path}, Command, State) ->
-    catch Process ! {'$$', Caller, Path, Command},
-    {noreply, State};
-refer(Caller, Process, Command, State) ->
-    catch Process ! {'$$', Caller, [], Command},
-    {noreply, State}.
-
-
 %%- Internal state operation.
 %%! Internal invocation without calling 'do' action.
 %% Synchronous version of invoke function without callback.
 -spec invoke(command(), target(), state()) -> result().
+invoke({put, _}, [], State) ->
+    {{error, badarg}, State};
 invoke(Command, {Proc, Path}, State) ->
     Timeout = maps:get(timeout, State, ?DFL_TIMEOUT),
     Result = call(Proc, Path, Command, Timeout),
@@ -853,61 +812,113 @@ invoke(Command, Path, State) ->
                     invoke(Command, Next, S);
                 {refer, Next, NewCmd, S} ->
                     invoke(NewCmd, Next, S);
+                Result when is_map(Result) ->
+                    {noreply, Result};
                 Result ->
                     Result
             end;
         {actor, Pid, Sprig} ->
             invoke(Command, {Pid, Sprig}, State);
-        _ ->
-            {{error, badarg}, State}
+        {delete, ok} ->
+            {stop, normal, stopping, State}
     end.
 
 %% Asynchoronous version invoke function with callback. For the sake of safety
 %% and clarity, callback function should be called in caller process.
--spec invoke(command(), target(), from(), state()) -> result().
+-spec invoke(command(), target(), from(), state()) -> state() | stop().
+invoke({put, _}, [], Caller, State) ->
+    reply(Caller, {error, badarg}, State);
 invoke(Command, Path, Caller, State) when is_tuple(Path) ->
     cast(Path, Command, Caller, local),
-    {noreply, State};
+    State;
 invoke(Command, Path, Caller, State) ->
     case access(Command, Path, State) of
         {result, Res} ->
-            {noreply, reply(Caller, Res, State)};
+            reply(Caller, Res, State);
         {update, Reply, NewState} ->
-            {noreply, reply(Caller, Reply, NewState)};
+            reply(Caller, Reply, NewState);
         {action, Act, Route} ->  % internal aysnchronous call.
-            Result = perform(Act, Command, Route, Caller, State),
-            response(Command, Caller, Result);
+            case perform(Act, Command, Route, Caller, State) of
+                {noreply, S0} ->
+                    S0;
+                {Reply, S0} ->
+                    reply(Caller, Reply, S0);
+                {refer, Target, S0} ->
+                    invoke(Command, Target, Caller, S0);
+                {refer, Target, NewCommand, S0} ->
+                    invoke(NewCommand, Target, Caller, S0);
+                {stop, _, _} = Stop ->
+                    Stop;
+                {stop, Reason, Reply, S0} ->
+                    S1 = reply(Caller, Reply, S0),
+                    {stop, Reason, S1};
+                S0 when is_map(S0) ->
+                    S0
+            end;
         {actor, Pid, Sprig} -> % external asyn call: {self(), Callback}.
             cast({Pid, Sprig}, Command, Caller, local),
-            {noreply, State};
-        _ ->
-            {{error, badarg}, State}
+            State;
+        {delete, ok} ->
+            S = reply(Caller, stopping, State),
+            {stop, normal, S}
     end.
 
 
--spec attach(tag(), state()) -> result().
-attach(Key, State) ->
-    Path = chain(props, Key),
-    case invoke(get, Path, State) of
-        {{error, _}, _} = Error ->
-            Error;
-        {Value, S1} ->
-            attach(Key, Value, S1);
-        Stop ->
-            Stop
+-spec map_reduce(command(), [target()], from(), state()) -> state().
+map_reduce(_, [], Acceptor, State) ->
+    reply(Acceptor, {error, undefined}, State);
+map_reduce(Command, [Path], Acceptor, State) ->
+    Func = fun(Res, _, S0) -> reply(Acceptor, [{Res, Path}], S0) end,
+    Modifier = {Func, undefined},
+    invoke(Command, Path, Modifier, State);
+map_reduce(Command, Paths, Acceptor, State) ->
+    Timeout = maps:get(timeout, State, infinity),
+    N = length(Paths),
+    Relay = localize(Acceptor, self()),
+    Pid = spawn_link(fun() -> mr_gather(N, [], Timeout, Relay) end),
+    Func = fun(Path, State0) ->
+                   Reducer = {Pid, {'$gather', Path}},
+                   invoke(Command, Path, Reducer, State0)
+           end,
+    lists:foldl(Func, State, Paths).
+
+mr_gather(0, R, _T, C) ->
+    reply(C, R);
+mr_gather(N, R, T, C) ->
+    receive
+        {{'$gather', Path}, Result} ->
+            mr_gather(N - 1, [{Result, Path} | R], T, C)
+    after
+        T ->
+            reply(C, {error, timeout})
     end.
+
+-spec localize(from(), pid()) -> from().
+localize({Func, Args}, Pid) when is_function(Func) ->
+    {Pid, {'$callback', Func, Args}};
+localize(Caller, _) ->
+    Caller.
+
 
 -spec attach(tag(), Value :: any(), state()) -> result().
-attach(Key, Pid, State) when is_pid(Pid) ->
+attach(Key, Value, State) ->
+    case maps:find(Key, State) of
+        {ok, V} ->
+            {{error, {existed, V}}, State};
+        error ->
+            attach_(Key, Value, State)
+    end.
+
+attach_(Key, Pid, State) when is_pid(Pid) ->
     case invoke({new, {Key, Pid}}, [monitors], State#{Key => Pid}) of
         {_, S} ->
             {ok, S};
         Stop ->
             Stop
     end;
-attach(Key, Func, State) when is_function(Func) ->
+attach_(Key, Func, State) when is_function(Func) ->
     {ok, State#{Key => Func}};
-attach(Key, {state, S}, State) ->
+attach_(Key, {state, S}, State) ->
     S1 = S#{surname => Key, parent => self()},
     case start(S1) of
         {ok, Pid} ->
@@ -922,9 +933,9 @@ attach(Key, {state, S}, State) ->
             {Error, State}
     end;
 %% To accept pid() or {state, any()} Value as raw data.
-attach(Key, {data, Value}, State) ->
+attach_(Key, {data, Value}, State) ->
     {ok, State#{Key => Value}};
-attach(_, _, State) ->
+attach_(_, _, State) ->
     {{error, badarg}, State}.
 
 
@@ -1107,7 +1118,7 @@ new_monitor({Key, Pid, Bond}, M) when is_pid(Pid) ->
     {Mref, M#{Mref => V, Key => V}};
 new_monitor({Key, Mref, Bond}, M) ->
     V = {Mref, Key, Bond},
-    {Mref, M#{Mref =>V, Key => V}};
+    {Mref, M#{Mref => V, Key => V}};
 new_monitor({K, V}, M) ->
     new_monitor({K, V, false}, M).
 
@@ -1116,14 +1127,10 @@ new_monitor({K, V}, M) ->
 %%------------------------------------------------------------------------------
 props_do({'$$', _, [props | _], _}, State) ->
     {unhandled, State};
-props_do({'$$', From, [Key | _] = Path, Command}, State) ->
-    %%!todo: optimize repeat fetching of Key.
-    case maps:is_key(Key, State) of
-        true ->
-            {unhandled, State};
-        false ->
-            refer(From, [props | Path], Command, State)
-    end;
+props_do({'$$', From, [raw | Path], Command}, State) ->
+    invoke(Command, Path, From, State);
+props_do({'$$', From, Path, Command}, State) ->
+    invoke(Command, [props | Path], From, State);
 props_do(_, State) ->
     {unhandled, State}.
 
@@ -1140,7 +1147,7 @@ swap(#{'$fsm' := F} = State) ->
 %% If $state is present before FSM start, it is an introducer for flexible
 %% initialization. Behaviors of subscribe and monitor are global attributes.
 fsm_do({'$$', From, ['$fsm' | Path], Command}, Fsm) ->
-    handle({'$$', From, Path, Command}, Fsm);
+    invoke(Command, Path, From, Fsm);
 fsm_do({'$$', _, [subscribers | _], _}, Fsm) ->
     {unhandled, Fsm};
 fsm_do({'$$', _, [monitors | _], _}, Fsm) ->
@@ -1190,20 +1197,30 @@ enter_state(Fsm) ->
 
 %%!todo: {stop, {transition, NewState}, State}, be free & evil.
 do_state(Info, State) ->
-    try handle_info(Info, State) of
-        {noreply, S} ->
-            {noreply, swap(S)};
-        {stop, normal, S} ->
-            S1 = on_exit(S),
-            Sign = maps:get(sign, S1, stop),
-            transition(Sign, swap(S1));
-        {stop, Shutdown, S} ->
-            {stop, Shutdown, swap(S)}
-    catch
-        error : function_clause when element(1, Info) =:= '$$' ->
-            S = reply(element(2, Info), {error, unknown}, State),
-            {noreply, swap(S)};
-        C : E ->
-            Fsm = swap(State),
-            transition(exception, Fsm#{payload => {C, E}})
-    end.
+    Result = try
+                 handle_info(Info, State)
+             catch
+                 error : function_clause when element(1, Info) =:= '$$' ->
+                     Caller = element(2, Info),
+                     {sugar, Caller, State};
+                 exit : {stop, _, _} = Stop ->
+                     Stop;
+                 C : E ->
+                     {exception, {C, E}, State}
+             end,
+    post_do(Result).
+
+post_do({noreply, State}) ->
+    {noreply, swap(State)};
+post_do({sugar, Caller, State}) ->
+    S = reply(Caller, {error, unknown}, State),
+    {noreply, swap(S)};
+post_do({stop, normal, State}) ->
+    S1 = on_exit(State),
+    Sign = maps:get(sign, S1, stop),
+    transition(Sign, swap(S1));
+post_do({stop, Reason, State}) ->
+    {stop, Reason, swap(State)};
+post_do({exception, Error, State}) ->
+    Fsm = swap(State),
+    transition(exception, Fsm#{payload => Error}).
