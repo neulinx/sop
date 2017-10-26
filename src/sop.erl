@@ -753,7 +753,7 @@ access({patch, Value}, [], Data)
   when is_map(Value) ->
     NewData = maps:merge(Data, Value),
     {update, ok, NewData};
-access({new, Value, #{key := Key}}, [], Data) ->
+access({new, Value, Key}, [], Data) ->
     {update, Key, Data#{Key => Value}};
 access({new, Value}, [], Data) ->
     {Key, NewData} = new_attribute(Value, Data),

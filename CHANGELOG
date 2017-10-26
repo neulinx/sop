@@ -1,3 +1,9 @@
+2017-10-26  Gary Hai  <gary@XL59.com>
+
+  * src/sop.app.src: Bump version to "3.0.1".
+
+  * src/sop.erl (access): Simplify new data with key for map type data.
+
 2017-10-19  Gary Hai  <gary@XL59.com>
 
   * src/sop.app.src: Bump version to "v3.0.0" for external commit.
