@@ -1,3 +1,17 @@
+2017-11-13  Gary Hai  <gary@XL59.com>
+
+  * src/sop.app.src: Bump version to "3.1.0".
+
+  * src/sop.erl (access): Beautify the code, handle {new, _, _} for leaf access.
+
+2017-11-11  Gary Hai  <gary@XL59.com>
+
+  * src/sop.erl (access): When access raw data, discard the options.
+
+2017-10-27  Gary Hai  <gary@XL59.com>
+
+  * src/sop.erl: Fix minor issue of dialyzer of missing 'prop' actor type.
+
 2017-10-26  Gary Hai  <gary@XL59.com>
 
   * src/sop.app.src: Bump version to "3.0.1".

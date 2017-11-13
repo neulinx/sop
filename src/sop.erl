@@ -174,7 +174,7 @@
 -type target() :: process() | path() | {process(), path()} | tag().
 
 %%-- actors
--type actor_type() :: 'stem' | 'actor' | 'fsm' | 'thing'.
+-type actor_type() :: 'prop' | 'actor' | 'fsm' | 'thing'.
 -type template() :: actor_type() | module() | map() |
                     [actor_type() | map()] | function().
 
@@ -738,26 +738,8 @@ access(_, Sprig, Data) when is_function(Data) ->
     {action, Data, Sprig};
 access(_, Sprig, Data) when is_pid(Data) ->
     {actor, Data, Sprig};
-%%--- The value of attribute or map type attributes.
-access(get, [], Data) ->
-    {result, Data};
-access({put, Value}, [], _) ->
-    {update, ok, Value};
-access(delete, [], _) ->
-    {delete, ok};
-access({get, Selection}, [], Data)
-  when is_list(Selection) ->
-    Value = maps:with(Selection, Data),
-    {result, Value};
-access({patch, Value}, [], Data)
-  when is_map(Value) ->
-    NewData = maps:merge(Data, Value),
-    {update, ok, NewData};
-access({new, Value, Key}, [], Data) ->
-    {update, Key, Data#{Key => Value}};
-access({new, Value}, [], Data) ->
-    {Key, NewData} = new_attribute(Value, Data),
-    {update, Key, NewData};
+access(Command, [], Data) ->
+    access_leaf(Command, Data);
 access(Command, [Key | Rest], Data) ->
     case maps:find(Key, Data) of
         {ok, Value} ->
@@ -772,11 +754,42 @@ access(Command, [Key | Rest], Data) ->
         error ->
             {result, {error, undefined}}
     end;
-access(_, [], _) ->
-    {result, {error, badarg}};
 %% Wrap Key into path list.
 access(Command, Key, State) ->
     access(Command, [Key], State).
+
+%%--- The value of attribute or map type attributes.
+access_leaf(get, Data) ->
+    {result, Data};
+access_leaf({get, _}, Data) ->
+    {result, Data};
+access_leaf({get, _, _}, Data) ->
+    {result, Data};
+access_leaf({put, Value}, _) ->
+    {update, ok, Value};
+access_leaf({put, Value, _}, _) ->
+    {update, ok, Value};
+access_leaf(delete, _) ->
+    {delete, ok};
+access_leaf({delete, _}, _) ->
+    {delete, ok};
+access_leaf({delete, _, _}, _) ->
+    {delete, ok};
+access_leaf({patch, Value}, Data)
+  when is_map(Value) ->
+    NewData = maps:merge(Data, Value),
+    {update, ok, NewData};
+access_leaf({patch, Value, _}, Data) ->
+    access_leaf({patch, Value}, Data);
+access_leaf({new, Value}, Data) ->
+    {Key, NewData} = new_attribute(Value, Data),
+    {update, Key, NewData};
+access_leaf({new, Value, #{key := Key}}, Data) ->
+    {update, Key, Data#{Key => Value}};
+access_leaf({new, Value, _}, Data) ->
+    access_leaf({new, Value}, Data);
+access_leaf(_, _) ->
+    {result, {error, badarg}}.
 
 
 -spec perform(function(), command(), target(), from(), state()) -> result().
