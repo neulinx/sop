@@ -48,9 +48,9 @@
 
 %% Operations.
 -export([stop/1, stop/2,
-         subscribe/1, subscribe/2,
+         subscribe/1, subscribe/2, subscribe/3,
          unsubscribe/2,
-         notify/2
+         notify/2, notify/3
         ]).
 
 %% Access.
@@ -566,14 +566,20 @@ delete(Path, Options) ->
 %%------------------------------------------------------------------------------
 -spec subscribe(target()) -> reply().
 subscribe(Path) ->
-    Target = chain(Path, subscribers),
-    call(Target, {new, self()}).
+    subscribe(Path, self(), []).
 
--spec subscribe(target(), pid()) -> reply().
-subscribe(Path, Pid) ->
-    Target = chain(Path, subscribers),
-    call(Target, {new, Pid}).
+-spec subscribe(target(), tag() | pid()) -> reply().
+subscribe(Path, Pid) when is_pid(Pid) ->
+    subscribe(Path, Pid, []);
+subscribe(Path, Tags) when is_list(Tags) ->
+    subscribe(Path, self(), Tags);
+subscribe(Path, Tag) ->
+    subscribe(Path, self(), [Tag]).
 
+-spec subscribe(target(), pid(), Tags :: list()) -> reply().
+subscribe(Path, Pid, Tags) ->
+    Target = chain(Path, subscribers),
+    call(Target, {new, Pid, Tags}).
 
 -spec unsubscribe(target(), reference()) -> reply().
 unsubscribe(Path, Ref) ->
@@ -583,8 +589,12 @@ unsubscribe(Path, Ref) ->
 
 -spec notify(target(), Info :: any()) -> reply().
 notify(Path, Info) ->
+    notify(Path, Info, <<>>).
+
+-spec notify(target(), Info :: any(), tag()) -> reply().
+notify(Path, Info, Tag) ->
     Target = chain(Path, subscribers),
-    call(Target, {notify, Info}).
+    call(Target, {notify, Info, Tag}).
 
 
 -spec stop(target()) -> reply().
@@ -1006,27 +1016,44 @@ remove_bond(_, State) ->
 %%  * '_subscribers': subscribers data cache.
 %%  * 'report_items': definition of output items when actor exit.
 subscribers({new, Pid}, [], State) ->
+    subscribers({new, Pid, []}, [], State);
+subscribers({new, Pid, Tags}, [], State) ->
     Subs = maps:get('_subscribers', State, #{}),
     Mref = monitor(process, Pid),
-    Subs1 = Subs#{Mref => Pid},
+    Subs1 = Subs#{Mref => {Pid, Tags}},
     {Mref, State#{'_subscribers' => Subs1}};
-subscribers({notify, Info}, [], #{'_subscribers' := Subs} = State) ->
-    maps:fold(fun(M, P, _) -> catch P ! {M, Info} end, 0, Subs),
-    {ok, State};
-subscribers({notify, Info, remove}, [], #{'_subscribers' := Subs} = State) ->
-    maps:fold(fun(Mref, Pid, _) ->
-                      catch Pid ! {Mref, Info},
+subscribers({notify, Info}, [], State) ->
+    subscribers({notify, Info, <<>>}, [], State);
+subscribers({notify, Info, Tag}, [], State) ->
+    notify_matched(Info, Tag, State);
+subscribers(delete, [], #{'_subscribers' := Subs} = State) ->
+    maps:fold(fun(Mref, _, _) ->
                       demonitor(Mref)
               end, 0, Subs),
-    {ok, maps:remove('_subscribers', State)};
+    {ok, State#{'_subscribers' := #{}}};
+subscribers(delete, [], State) ->
+    {ok, State};
 subscribers(delete, [Mref], #{'_subscribers' := Subs} = State) ->
     demonitor(Mref),
     Subs1 = maps:remove(Mref, Subs),
     {ok, State#{'_subscribers' := Subs1}};
-subscribers(delete, Mref, State) ->
-    subscribers(delete, [Mref], State);
 subscribers(_, _, State) ->
     {{error, badarg}, State}.
+
+notify_matched(Info, Tag, #{'_subscribers' := Subs} = State) ->
+    Count = maps:fold(fun(M, {P, Tags}, N) ->
+                              case lists:member(Tag, Tags) of
+                                  true ->
+                                      catch P ! {M, Tag, Info},
+                                      N + 1;
+                                  false ->
+                                      N
+                              end
+                      end, 0, Subs),
+    {Count, State};
+notify_matched(_, _, State) ->
+    {0, State}.
+
 
 subscribers_do({'DOWN', M, _, _, _}, State) ->
     case maps:find('_subscribers', State) of
@@ -1043,7 +1070,8 @@ subscribers_exit(State) ->
     Detail = maps:get('report_items', State, []),
     Report = make_report(Detail, State),
     Info = {exit, Report},
-    {_, S} = invoke({notify, Info, remove}, [subscribers], State),
+    {_, S0} = invoke({notify, Info, system}, [subscribers], State),
+    {_, S} = invoke(delete, [subscribers], S0),
     S.
 
 %% Selective report.
@@ -1185,7 +1213,7 @@ transition(Sign, Fsm) ->
     Step = maps:get(step, Fsm, 0),
     F1 = Fsm#{step => Step + 1},
     %% Asynchronously notify.
-    cast([self(), subscribers], {notify, {transition, Step, Sign}}),
+    cast([self(), subscribers], {notify, {Step, Sign}, state}),
     %% states should handle exceptions. For examples: vertex of sign is not
     %% found or exceed max steps limited.
     case invoke(get, [states, Sign], F1) of
