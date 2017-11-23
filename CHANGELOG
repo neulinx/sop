@@ -1,3 +1,12 @@
+2017-11-23  Gary Hai  <gary@XL59.com>
+
+  * src/sop.app.src: Bump version to "3.2.0".
+
+  * src/sop.erl: Subscribe/Notify support category.
+  (subscribe): Add a new parameter as category list to filter notifications.
+  (notify): Add a new parameter as tag to classify notifications.
+  (subscribers): Support category and remove all subscribers.
+
 2017-11-13  Gary Hai  <gary@XL59.com>
 
   * src/sop.app.src: Bump version to "3.1.0".
