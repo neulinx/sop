@@ -19,7 +19,12 @@
 
 %% Support inline unit test for EUnit.
 -ifdef(TEST).
-    -include_lib("eunit/include/eunit.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-define(LOG(V), ?debugVal(V, 100)).
+-define(LOG(Note, V), ?debugFmt("~s ~tp~n", [Note, V])).
+-else.
+-define(LOG(V), io:format("~tp~n", [V])).
+-define(LOG(Note, V), io:format("~s ~tp~n", [Note, V])).
 -endif.
 
 

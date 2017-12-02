@@ -1,3 +1,9 @@
+2017-12-02  Gary Hai  <gary@XL59.com>
+
+  * src/sop.app.src: Bump version "3.2.1".
+
+  * src/sop.erl: Add macro LOG for debug in console.
+
 2017-11-23  Gary Hai  <gary@XL59.com>
 
   * src/sop.app.src: Bump version to "3.2.0".
