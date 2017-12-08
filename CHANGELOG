@@ -1,3 +1,10 @@
+2017-12-08  Gary Hai  <gary@XL59.com>
+
+  * src/sop.app.src: Bump version to "3.3.1".
+
+  * src/sop.erl (access): Don't be crashed of iteration in non-map type data.
+  (monitors): Add potential reload mechanism of cast down message to the Key.
+
 2017-12-02  Gary Hai  <gary@XL59.com>
 
   * src/sop.app.src: Bump version "3.2.1".
