@@ -755,7 +755,7 @@ access(_, Sprig, Data) when is_pid(Data) ->
     {actor, Data, Sprig};
 access(Command, [], Data) ->
     access_leaf(Command, Data);
-access(Command, [Key | Rest], Data) ->
+access(Command, [Key | Rest], Data) when is_map(Data) ->
     case maps:find(Key, Data) of
         {ok, Value} ->
             case access(Command, Rest, Value) of
@@ -769,9 +769,10 @@ access(Command, [Key | Rest], Data) ->
         error ->
             {result, {error, undefined}}
     end;
-%% Wrap Key into path list.
-access(Command, Key, State) ->
-    access(Command, [Key], State).
+%% access(Command, Key, Data) when not is_list(Key) ->
+%%     access(Command, [Key], Data);
+access(_, _, _) ->
+    {result, {error, badarg}}.
 
 %%--- The value of attribute or map type attributes.
 access_leaf(get, Data) ->
@@ -1123,16 +1124,24 @@ monitors({new, V}, [], State) ->
     M = maps:get('_monitors', State, #{}),
     {Ref, M1} = new_monitor(V, M),
     {Ref, State#{'_monitors' => M1}};
-monitors({'DOWN', Mref, _, _Pid, Reason}, [], #{'_monitors' := M} = State) ->
+monitors({'DOWN', Mref, _, Pid, Reason}, [], #{'_monitors' := M} = State) ->
     case maps:take(Mref, M) of
         {{Mref, Key, true}, M1} ->
             %% Remove monitor but keep Key in State.
             M2 = maps:remove(Key, M1),
-            {_, S1} = invoke({delete, raw}, Key, State#{'_monitors' := M2}),
+            K = case is_list(Key) of true -> Key; false -> [Key] end,
+            {_, S1} = invoke({delete, raw}, K, State#{'_monitors' := M2}),
             {stop, {shutdown, Reason}, S1};
         {{Mref, Key, false}, M1} ->
             M2 = maps:remove(Key, M1),
-            {_, S1} = invoke({delete, raw}, Key, State#{'_monitors' := M2}),
+            K = case is_list(Key) of true -> Key; false -> [Key] end,
+            {_, S1} = invoke({delete, raw}, K, State#{'_monitors' := M2}),
+            case Reason of
+                normal ->
+                    ok;
+                _ ->
+                    cast({self(), K}, {'$down', Pid, Reason})
+            end,
             {noreply, S1};
         _ ->
             {unhandled, State}
