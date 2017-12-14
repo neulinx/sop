@@ -1,3 +1,12 @@
+2017-12-14  Gary Hai  <gary@XL59.com>
+
+  * src/sop.app.src: Bump version to "3.4.0", monitors!
+
+  * src/sop.erl (access): Add command for matching delete, and selective get.
+  (monitors): Double-check before deleting because asynchronous gaps.
+  (monitors): Bound process down cause stop of current actor with full data.
+  (monitors_do): If it cannot solve all problems, git rid of it.
+
 2017-12-08  Gary Hai  <gary@XL59.com>
 
   * src/sop.app.src: Bump version to "3.3.1".
