@@ -748,6 +748,9 @@ access({put, Value, raw}, [], _) ->
     {update, ok, Value};
 access({delete, raw}, [], _) ->
     {delete, ok};
+%% Delete matched attribute.
+access({delete, Value, raw}, [], Value) ->
+    {delete, ok};
 %%--- Active attributes.
 access(_, Sprig, Data) when is_function(Data) ->
     {action, Data, Sprig};
@@ -779,8 +782,8 @@ access_leaf(get, Data) ->
     {result, Data};
 access_leaf({get, _}, Data) ->
     {result, Data};
-access_leaf({get, _, _}, Data) ->
-    {result, Data};
+access_leaf({get, Keys, _}, Data) when is_list(Keys) andalso is_map(Data) ->
+    {result, maps:with(Keys, Data)};
 access_leaf({put, Value}, _) ->
     {update, ok, Value};
 access_leaf({put, Value, _}, _) ->
@@ -789,7 +792,7 @@ access_leaf(delete, _) ->
     {delete, ok};
 access_leaf({delete, _}, _) ->
     {delete, ok};
-access_leaf({delete, _, _}, _) ->
+access_leaf({delete, Value, _}, Value) ->
     {delete, ok};
 access_leaf({patch, Value}, Data)
   when is_map(Value) ->
@@ -1126,16 +1129,17 @@ monitors({new, V}, [], State) ->
     {Ref, State#{'_monitors' => M1}};
 monitors({'DOWN', Mref, _, Pid, Reason}, [], #{'_monitors' := M} = State) ->
     case maps:take(Mref, M) of
-        {{Mref, Key, true}, M1} ->
-            %% Remove monitor but keep Key in State.
-            M2 = maps:remove(Key, M1),
+        {{Mref, _, true}, _} ->
+            {stop, {shutdown, Reason}, State};
+        {{Mref, Key, false} = V, M1} ->
+            M2 = case maps:take(Key, M1) of
+                     {V, M0} ->  %% must match Mref.
+                         M0;
+                     _ ->
+                         M1
+                 end,
             K = case is_list(Key) of true -> Key; false -> [Key] end,
-            {_, S1} = invoke({delete, raw}, K, State#{'_monitors' := M2}),
-            {stop, {shutdown, Reason}, S1};
-        {{Mref, Key, false}, M1} ->
-            M2 = maps:remove(Key, M1),
-            K = case is_list(Key) of true -> Key; false -> [Key] end,
-            {_, S1} = invoke({delete, raw}, K, State#{'_monitors' := M2}),
+            {_, S1} = invoke({delete, Pid, raw}, K, State#{'_monitors' := M2}),
             case Reason of
                 normal ->
                     ok;
@@ -1151,13 +1155,14 @@ monitors({'DOWN', _, _, _, _}, [], State) ->
 monitors(_, _, State) ->
     {{error, badarg}, State}.
 
-monitors_do({'$$', _, Key, delete}, State) ->
-    case invoke(delete, [monitors, Key], State) of
-        {_, S} ->
-            {unhandled, S};
-        Stop ->
-            Stop
-    end;
+%%%% If it cannot solve all problems, git rid of it.
+%% monitors_do({'$$', _, Key, delete}, State) ->
+%%     case invoke(delete, [monitors, Key], State) of
+%%         {_, S} ->
+%%             {unhandled, S};
+%%         Stop ->
+%%             Stop
+%%     end;
 monitors_do({'DOWN', _, _, _, _} = Down, State) ->
     invoke(Down, [monitors], State);
 monitors_do(_, State) ->
