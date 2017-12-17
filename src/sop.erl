@@ -9,7 +9,7 @@
 %%%  * Args of callback function is copied between process, so keep it small.
 %%%  * It is recommended to use the erlang:exit/1 function to quit process.
 %%%  * If you don't want caller to touch your actor state by callback, you
-%%%    should always call reply/2 instead of reply/3 to response.
+%%%    should always call reply/2 instead of reply/3 to respond.
 %%% @end
 %%% Created : 24 May 2017 by Gary Hai <gary@XL59.com>
 %%%-----------------------------------------------------------------------------
@@ -188,13 +188,21 @@
 %%------------------------------------------------------------------------------
 -define(DFL_TIMEOUT, 4000).
 -define(DFL_MAX_STEPS, infinity).  % self-destructure as brute self-heal.
+-define(IDLE_TO_HIBERNATE, 10*60000).  % enter hibernate after 60 seconds idle.
 
 
 %%- Starts the server
 %%------------------------------------------------------------------------------
 -spec start(state()) -> start_ret().
 start(State) ->
-    Opts = maps:get(start_options, State, []),
+    Opts0 = maps:get(start_options, State, []),
+    %% Add default 'hibernate_after' option if it is not present.
+    Opts = case proplists:is_defined(hibernate_after, Opts0) of
+               true ->
+                   Opts0;
+               false ->
+                   [{hibernate_after, ?IDLE_TO_HIBERNATE} | Opts0]
+           end,
     Solo = ({ok, solo} =:= maps:find(run_mode, State)),
     case maps:find(register_name, State) of
         {ok, Name} when Solo ->
